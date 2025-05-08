@@ -476,6 +476,14 @@ def index_files(limit=None):
                     logging.info(f"Skipping OCR for {pdf_file}, using existing OCR text: {ocr_path}")
                     with open(ocr_path, 'r') as f:
                         content = f.read()
+                    # Re-extract metadata since it might not have been stored correctly
+                    metadata = extract_metadata(pdf_path)
+                    if metadata is None:
+                        logging.warning(f"Failed to extract metadata for {pdf_file}. Skipping file.")
+                        indexing_status_dict["files_processed"] += 1
+                        indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
+                        save_indexing_status()
+                        continue
                 else:
                     logging.info(f"Indexing {pdf_file}...")
                     
@@ -1518,4 +1526,39 @@ systemctl restart jfk-index.service
 cd "$REPO_DIR"
 
 # Copy the rotated log files to the repository
-cp "$BASE_DIR/indexing_$PREV
+cp "$BASE_DIR/indexing_$PREV_DATE.log" .
+cp "$BASE_DIR/jfk_manager_$PREV_DATE.log" .
+
+# Also copy the current log files (which are now empty or starting fresh)
+if [ -f "$LOG_PATH" ]; then
+    cp "$LOG_PATH" .
+else
+    touch indexing.log
+fi
+if [ -f "$MANAGER_LOG_PATH" ]; then
+    cp "$MANAGER_LOG_PATH" .
+else
+    touch jfk_manager.log
+fi
+
+# Commit and push to GitHub
+git add .
+git commit -m "Daily log rotation and upload - $PREV_DATE"
+git push origin main
+
+echo "Log files rotated and previous day's logs uploaded to GitHub at $(date)."
+EOF
+chmod +x "$CRON_SCRIPT"
+chown jfk:jfk "$CRON_SCRIPT"
+chmod 775 "$CRON_SCRIPT"
+
+# Add cron job to run daily at midnight
+(crontab -l 2>/dev/null; echo "0 0 * * * $CRON_SCRIPT") | crontab -
+echo "Cron job set up to rotate and upload log files daily at midnight to GitHub."
+
+echo "Installation complete! The JFK document management system is fully set up and running."
+echo "The system will automatically start on boot."
+echo "Access the web interface at http://192.168.1.176:5000"
+echo "Monitor indexing progress with: tail -f $LOG_PATH"
+echo "Files and logs are being uploaded to GitHub at $REPO_URL."
+echo "Log rotation and uploads will occur daily at midnight."

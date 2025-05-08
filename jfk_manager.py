@@ -386,6 +386,14 @@ def index_files(limit=None):
                     logging.info(f"Skipping OCR for {pdf_file}, using existing OCR text: {ocr_path}")
                     with open(ocr_path, 'r') as f:
                         content = f.read()
+                    # Re-extract metadata since it might not have been stored correctly
+                    metadata = extract_metadata(pdf_path)
+                    if metadata is None:
+                        logging.warning(f"Failed to extract metadata for {pdf_file}. Skipping file.")
+                        indexing_status_dict["files_processed"] += 1
+                        indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
+                        save_indexing_status()
+                        continue
                 else:
                     logging.info(f"Indexing {pdf_file}...")
                     
