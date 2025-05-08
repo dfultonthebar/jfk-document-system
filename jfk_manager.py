@@ -14,7 +14,7 @@ import json
 import threading
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_from_directory
 from PIL import Image
 import easyocr
 import mysql.connector
@@ -96,6 +96,20 @@ try:
 except Exception as e:
     logging.error(f"Failed to initialize EasyOCR with CPU support: {str(e)}. Exiting...")
     raise
+
+# Track initial file count for newly added files
+initial_file_count = 0
+def count_files():
+    """Count the total number of PDF files in national_archives and dallas_police directories."""
+    total = 0
+    for subdir in ["national_archives", "dallas_police"]:
+        subdir_path = os.path.join(BASE_DIR, subdir)
+        if os.path.exists(subdir_path):
+            total += len([f for f in os.listdir(subdir_path) if f.endswith('.pdf')])
+    return total
+
+# Set initial file count at startup
+initial_file_count = count_files()
 
 def save_indexing_status():
     """Save the indexing status to a file."""
@@ -743,14 +757,7 @@ def index():
     """Render the web interface."""
     logging.info("Handling request for /")
     try:
-        pdf_files = []
-        for subdir in ["national_archives", "dallas_police"]:
-            subdir_path = os.path.join(BASE_DIR, subdir)
-            pdf_files.extend(
-                [os.path.join(subdir, f) for f in os.listdir(subdir_path) if f.endswith('.pdf')]
-            )
-        logging.info(f"Found {len(pdf_files)} PDF files to display")
-        return render_template('index.html', files=pdf_files)
+        return render_template('index.html')
     except Exception as e:
         logging.error(f"Error rendering web interface: {str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -852,6 +859,54 @@ def indexing_status():
     status = load_indexing_status()
     logging.info(f"Indexing status - In progress: {status['in_progress']}, Progress: {status['progress']}%")
     return jsonify(status)
+
+@app.route('/total_files')
+def total_files():
+    """Return the total number of downloaded files."""
+    logging.info("Handling request for /total_files")
+    try:
+        total = count_files()
+        logging.info(f"Total files: {total}")
+        return jsonify({"total_files": total})
+    except Exception as e:
+        logging.error(f"Error fetching total files: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/new_files')
+def new_files():
+    """Return the number of newly added files since startup."""
+    logging.info("Handling request for /new_files")
+    try:
+        current_count = count_files()
+        new_files = max(0, current_count - initial_file_count)
+        logging.info(f"New files since startup: {new_files}")
+        return jsonify({"new_files": new_files})
+    except Exception as e:
+        logging.error(f"Error fetching new files: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/files/<path:filepath>')
+def serve_file(filepath):
+    """Serve a file from the BASE_DIR."""
+    logging.info(f"Handling request for file: {filepath}")
+    try:
+        # Construct the full path to the file
+        full_path = os.path.join(BASE_DIR, filepath)
+        # Ensure the file exists and is within BASE_DIR
+        if not os.path.exists(full_path):
+            logging.error(f"File not found: {full_path}")
+            return jsonify({"error": "File not found"}), 404
+        if not full_path.startswith(BASE_DIR):
+            logging.error(f"Access denied: {full_path} is outside of BASE_DIR")
+            return jsonify({"error": "Access denied"}), 403
+        # Serve the file
+        directory = os.path.dirname(full_path)
+        filename = os.path.basename(full_path)
+        logging.info(f"Serving file: {full_path}")
+        return send_from_directory(directory, filename, as_attachment=True)
+    except Exception as e:
+        logging.error(f"Error serving file {filepath}: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     import argparse
