@@ -39,7 +39,7 @@ mysql -u root -e "GRANT ALL PRIVILEGES ON jfk_db.* TO 'jfk_search'@'localhost';"
 mysql -u root -e "FLUSH PRIVILEGES;"
 mysql -u root jfk_db << 'EOF'
 CREATE TABLE IF NOT EXISTS files (
-    id VARCHAR(255) PRIMARY KEY,
+    id VARCHAR(512) PRIMARY KEY,  -- Increased size to handle longer IDs
     filename TEXT NOT NULL,
     content TEXT,
     index_time DATETIME,
@@ -137,6 +137,13 @@ MYSQL_CONFIG = {
 STATUS_FILE = os.path.join(BASE_DIR, "indexing_status.json")
 DALLAS_POLICE_DIR = os.path.join(BASE_DIR, "dallas_police")
 SPEED_LOG_FILE = "/jfk_data/dallas_police_download_speed.json"
+
+# Initialize the download speed file
+if not os.path.exists(SPEED_LOG_FILE):
+    with open(SPEED_LOG_FILE, 'w') as f:
+        json.dump({"download_speed": 0}, f)
+    os.chmod(SPEED_LOG_FILE, 0o664)
+    os.chown(SPEED_LOG_FILE, 1000, 1000)  # Assuming jfk user has UID/GID 1000
 
 # Global dictionaries to track download and indexing status with thread safety
 download_status_dict = {
@@ -694,7 +701,7 @@ def download_national_archives():
                 requests.head(download_url)
                 elapsed = time.time() - chunk_start_time
                 with download_status_lock:
-                    download_status_dict["download_speed"] = (1024 / 1024) / elapsed  # Simulate 1 KB download
+                    download_status_dict["download_speed"] = (1024 / 1024) / elapsed if elapsed > 0 else 0  # Simulate 1 KB download
                     logging.info(f"Simulated download speed for skipped file: {download_status_dict['download_speed']:.2f} KB/s")
                 time.sleep(1)  # Delay to keep gauge active
                 continue
@@ -797,7 +804,7 @@ def run_dallas_police_scraper():
                     with download_status_lock:
                         download_status_dict["download_speed"] = speed_data.get("download_speed", 0)
                         logging.info(f"Dallas Police download speed: {download_status_dict['download_speed']:.2f} KB/s")
-            except Exception as e:
+            except (json.JSONDecodeError, FileNotFoundError) as e:
                 logging.error(f"Failed to read download speed: {str(e)}")
                 with download_status_lock:
                     download_status_dict["download_speed"] = 0
@@ -1305,14 +1312,17 @@ def scrape_dallas_police():
             chunk_start_time = time.time()
             response = requests.get(page_url, stream=True)
             response.raise_for_status()
+            # Read the response content into a variable to avoid consuming it twice
+            content = b""
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if chunk:
+                    content += chunk
                     chunk_bytes += len(chunk)
                     elapsed = time.time() - chunk_start_time
                     update_download_speed(chunk_bytes, elapsed)
                     chunk_bytes = 0
                     chunk_start_time = time.time()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(content, 'html.parser')
             
             # Find all document links with 'metapth' identifiers
             doc_links = soup.find_all('a', href=re.compile(r'/ark:/67531/metapth\d+'))

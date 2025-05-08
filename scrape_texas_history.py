@@ -90,14 +90,17 @@ def scrape_dallas_police():
             chunk_start_time = time.time()
             response = requests.get(page_url, stream=True)
             response.raise_for_status()
+            # Read the response content into a variable to avoid consuming it twice
+            content = b""
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if chunk:
+                    content += chunk
                     chunk_bytes += len(chunk)
                     elapsed = time.time() - chunk_start_time
                     update_download_speed(chunk_bytes, elapsed)
                     chunk_bytes = 0
                     chunk_start_time = time.time()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(content, 'html.parser')
             
             # Find all document links with 'metapth' identifiers
             doc_links = soup.find_all('a', href=re.compile(r'/ark:/67531/metapth\d+'))
