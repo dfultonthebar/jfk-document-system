@@ -45,6 +45,7 @@ MYSQL_CONFIG = {
 }
 STATUS_FILE = os.path.join(BASE_DIR, "indexing_status.json")
 DALLAS_POLICE_DIR = os.path.join(BASE_DIR, "dallas_police")
+SPEED_LOG_FILE = "/jfk_data/dallas_police_download_speed.json"
 
 # Global dictionaries to track download and indexing status
 download_status_dict = {
@@ -623,7 +624,24 @@ def run_dallas_police_scraper():
     try:
         # Change to the dallas_police directory to run the scraper
         os.chdir(DALLAS_POLICE_DIR)
-        subprocess.run(["/jfk_data/scrape_texas_history.py"], check=True)
+        process = subprocess.Popen(["/jfk_data/scrape_texas_history.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Poll the speed log file while the subprocess is running
+        while process.poll() is None:
+            try:
+                with open(SPEED_LOG_FILE, 'r') as f:
+                    speed_data = json.load(f)
+                    download_status_dict["download_speed"] = speed_data.get("download_speed", 0)
+            except Exception as e:
+                logging.error(f"Failed to read download speed: {str(e)}")
+                download_status_dict["download_speed"] = 0
+            time.sleep(1)  # Check every second
+        
+        # Check if the subprocess completed successfully
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            logging.error(f"Error running Dallas Police scraper: {stderr.decode()}")
+            raise subprocess.CalledProcessError(process.returncode, process.args, stderr)
         logging.info("Dallas Police Archives download completed.")
     except subprocess.CalledProcessError as e:
         logging.error(f"Error running Dallas Police scraper: {str(e)}")

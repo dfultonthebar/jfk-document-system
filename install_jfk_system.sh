@@ -18,6 +18,7 @@ STATUS_FILE="$BASE_DIR/indexing_status.json"
 REPO_DIR="$BASE_DIR/jfk-document-system"
 REPO_URL="git@github.com:dfultonthebar/jfk-document-system.git"
 DALLAS_POLICE_DIR="$BASE_DIR/dallas_police"
+TEMPLATES_DIR="$BASE_DIR/templates"
 
 # Store the absolute path of this script
 SCRIPT_PATH="$(realpath "$0")"
@@ -129,6 +130,7 @@ MYSQL_CONFIG = {
 }
 STATUS_FILE = os.path.join(BASE_DIR, "indexing_status.json")
 DALLAS_POLICE_DIR = os.path.join(BASE_DIR, "dallas_police")
+SPEED_LOG_FILE = "/jfk_data/dallas_police_download_speed.json"
 
 # Global dictionaries to track download and indexing status
 download_status_dict = {
@@ -707,7 +709,24 @@ def run_dallas_police_scraper():
     try:
         # Change to the dallas_police directory to run the scraper
         os.chdir(DALLAS_POLICE_DIR)
-        subprocess.run(["/jfk_data/scrape_texas_history.py"], check=True)
+        process = subprocess.Popen(["/jfk_data/scrape_texas_history.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Poll the speed log file while the subprocess is running
+        while process.poll() is None:
+            try:
+                with open(SPEED_LOG_FILE, 'r') as f:
+                    speed_data = json.load(f)
+                    download_status_dict["download_speed"] = speed_data.get("download_speed", 0)
+            except Exception as e:
+                logging.error(f"Failed to read download speed: {str(e)}")
+                download_status_dict["download_speed"] = 0
+            time.sleep(1)  # Check every second
+        
+        # Check if the subprocess completed successfully
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            logging.error(f"Error running Dallas Police scraper: {stderr.decode()}")
+            raise subprocess.CalledProcessError(process.returncode, process.args, stderr)
         logging.info("Dallas Police Archives download completed.")
     except subprocess.CalledProcessError as e:
         logging.error(f"Error running Dallas Police scraper: {str(e)}")
@@ -863,6 +882,241 @@ EOF
 # Set permissions for jfk_manager.py
 chmod +x "$JFK_MANAGER_PATH"
 
+# Step 7.1: Create the index.html template with a download speed gauge
+echo "Step 7.1: Creating index.html with download speed gauge..."
+mkdir -p "$TEMPLATES_DIR"
+cat > "$TEMPLATES_DIR/index.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JFK Document Management System</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f4f4f4;
+        }
+        h1 {
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .gauge {
+            width: 300px;
+            height: 200px;
+            margin: 20px 0;
+        }
+        .file-list {
+            list-style-type: none;
+            padding: 0;
+        }
+        .file-list li {
+            background-color: #fff;
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .search-box {
+            margin: 20px 0;
+        }
+        .search-box input {
+            padding: 10px;
+            width: 300px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        .search-box button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: #fff;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .search-box button:hover {
+            background-color: #0056b3;
+        }
+        #search-results {
+            margin-top: 20px;
+        }
+        .log-box {
+            margin-top: 20px;
+            background-color: #fff;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            max-height: 300px;
+            overflow-y: auto;
+        }
+    </style>
+    <!-- Include JustGage and Raphael for the gauge -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/raphael/2.3.0/raphael.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/justgage/1.2.2/justgage.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>JFK Document Management System</h1>
+        
+        <!-- Download Speed Gauge -->
+        <h2>Download Status</h2>
+        <div id="download-gauge" class="gauge"></div>
+        <p id="download-status">Download in progress: <span id="download-in-progress">No</span></p>
+        
+        <!-- Indexing Status -->
+        <h2>Indexing Status</h2>
+        <p>Indexing in progress: <span id="indexing-in-progress">No</span></p>
+        <p>Progress: <span id="indexing-progress">0%</span> (<span id="files-processed">0</span>/<span id="total-files">0</span>)</p>
+        
+        <!-- File List -->
+        <h2>Available Files</h2>
+        <ul class="file-list">
+            {% for file in files %}
+                <li>{{ file }}</li>
+            {% endfor %}
+        </ul>
+        
+        <!-- Search Box -->
+        <h2>Search Documents</h2>
+        <div class="search-box">
+            <input type="text" id="search-query" placeholder="Search documents...">
+            <button onclick="searchDocuments()">Search</button>
+        </div>
+        <div id="search-results"></div>
+        
+        <!-- System Metrics -->
+        <h2>System Metrics</h2>
+        <p>CPU Usage: <span id="cpu-usage">0%</span></p>
+        <p>Memory Usage: <span id="memory-usage">0%</span></p>
+        <p>GPU Usage: <span id="gpu-usage">0%</span></p>
+        
+        <!-- Logs -->
+        <h2>Recent Logs</h2>
+        <div class="log-box" id="logs"></div>
+    </div>
+
+    <script>
+        // Initialize the gauge
+        let gauge = new JustGage({
+            id: "download-gauge",
+            value: 0,
+            min: 0,
+            max: 150000,  // 150,000 KB/s (150 MB/s) to accommodate 1 Gbps fiber
+            title: "Download Speed",
+            label: "KB/s",
+            gaugeWidthScale: 0.6,
+            levelColors: ["#ff0000", "#f9c802", "#00ff00"],
+            decimals: 2,
+            customSectors: {
+                percents: true,  // Use percentage-based sectors
+                ranges: [
+                    { from: 0, to: 20, color: "#ff0000" },  // 0-20% of max (0-30,000 KB/s)
+                    { from: 20, to: 60, color: "#f9c802" },  // 20-60% of max (30,000-90,000 KB/s)
+                    { from: 60, to: 100, color: "#00ff00" }  // 60-100% of max (90,000-150,000 KB/s)
+                ]
+            },
+            counter: true
+        });
+
+        // Function to update the download status and gauge
+        function updateDownloadStatus() {
+            fetch('/download_status')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('download-in-progress').textContent = data.in_progress ? "Yes" : "No";
+                    gauge.refresh(data.download_speed);
+                })
+                .catch(error => console.error('Error fetching download status:', error));
+        }
+
+        // Function to update the indexing status
+        function updateIndexingStatus() {
+            fetch('/indexing_status')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('indexing-in-progress').textContent = data.in_progress ? "Yes" : "No";
+                    document.getElementById('indexing-progress').textContent = data.progress.toFixed(2) + '%';
+                    document.getElementById('files-processed').textContent = data.files_processed;
+                    document.getElementById('total-files').textContent = data.total_files;
+                })
+                .catch(error => console.error('Error fetching indexing status:', error));
+        }
+
+        // Function to update system metrics
+        function updateSystemMetrics() {
+            fetch('/system_metrics')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('cpu-usage').textContent = data.cpu_usage.toFixed(2) + '%';
+                    document.getElementById('memory-usage').textContent = data.memory_usage.toFixed(2) + '%';
+                    document.getElementById('gpu-usage').textContent = data.gpu_usage.toFixed(2) + '%';
+                })
+                .catch(error => console.error('Error fetching system metrics:', error));
+        }
+
+        // Function to update logs
+        function updateLogs() {
+            fetch('/logs')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('logs').innerHTML = data.logs.join('<br>');
+                })
+                .catch(error => console.error('Error fetching logs:', error));
+        }
+
+        // Function to search documents
+        function searchDocuments() {
+            const query = document.getElementById('search-query').value;
+            if (!query) {
+                alert("Please enter a search query.");
+                return;
+            }
+            fetch(`/search?q=${encodeURIComponent(query)}`)
+                .then(response => response.json())
+                .then(data => {
+                    const resultsDiv = document.getElementById('search-results');
+                    if (data.error) {
+                        resultsDiv.innerHTML = `<p>Error: ${data.error}</p>`;
+                        return;
+                    }
+                    if (data.length === 0) {
+                        resultsDiv.innerHTML = "<p>No results found.</p>";
+                        return;
+                    }
+                    let html = "<ul>";
+                    data.forEach(result => {
+                        html += `<li><strong>${result.filename}</strong><br>`;
+                        html += `Date: ${result.date || 'N/A'}, Time: ${result.time || 'N/A'}<br>`;
+                        html += `Location: ${result.location || 'N/A'}<br>`;
+                        html += `Mission Names: ${result.mission_names || 'N/A'}<br>`;
+                        html += `Content: ${result.content ? result.content.substring(0, 200) + '...' : 'N/A'}</li>`;
+                    });
+                    html += "</ul>";
+                    resultsDiv.innerHTML = html;
+                })
+                .catch(error => console.error('Error searching documents:', error));
+        }
+
+        // Update statuses every 2 seconds
+        setInterval(updateDownloadStatus, 2000);
+        setInterval(updateIndexingStatus, 2000);
+        setInterval(updateSystemMetrics, 2000);
+        setInterval(updateLogs, 5000);
+
+        // Initial updates
+        updateDownloadStatus();
+        updateIndexingStatus();
+        updateSystemMetrics();
+        updateLogs();
+    </script>
+</body>
+</html>
+EOF
+
 # Step 8: Create the scrape_texas_history.py script
 echo "Step 8: Creating scrape_texas_history.py to download Dallas Police Archives..."
 cat > "$SCRAPER_PATH" << 'EOF'
@@ -872,6 +1126,8 @@ import logging
 import requests
 import os
 import re
+import time
+import json
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
@@ -888,6 +1144,24 @@ logging.basicConfig(
 # Define the directory to save files
 SAVE_DIR = "/jfk_data/dallas_police"
 BASE_URL = "https://texashistory.unt.edu/explore/collections/JFKDP/browse/"
+SPEED_LOG_FILE = "/jfk_data/dallas_police_download_speed.json"
+
+def update_download_speed(bytes_downloaded, elapsed_time):
+    """Update the download speed in a shared file."""
+    speed = (bytes_downloaded / 1024) / elapsed_time  # KB/s
+    try:
+        with open(SPEED_LOG_FILE, 'w') as f:
+            json.dump({"download_speed": speed}, f)
+    except Exception as e:
+        logging.error(f"Failed to update download speed: {str(e)}")
+
+def clear_download_speed():
+    """Clear the download speed file."""
+    try:
+        with open(SPEED_LOG_FILE, 'w') as f:
+            json.dump({"download_speed": 0}, f)
+    except Exception as e:
+        logging.error(f"Failed to clear download speed: {str(e)}")
 
 def scrape_dallas_police():
     """Scrape and download PDF files from the Dallas Police Archives on the Portal to Texas History."""
@@ -895,6 +1169,9 @@ def scrape_dallas_police():
     
     # Ensure the save directory exists
     os.makedirs(SAVE_DIR, exist_ok=True)
+    
+    # Clear the download speed at the start
+    clear_download_speed()
     
     # Start with the first page of the collection
     page_url = BASE_URL
@@ -928,17 +1205,28 @@ def scrape_dallas_police():
                 # Download the PDF
                 logging.info(f"Downloading {pdf_url} to {pdf_filename}...")
                 try:
+                    chunk_size = 8192
+                    chunk_bytes = 0
+                    chunk_start_time = time.time()
                     pdf_response = requests.get(pdf_url, stream=True)
                     pdf_response.raise_for_status()
                     
                     with open(pdf_filename + ".tmp", 'wb') as f:
-                        for chunk in pdf_response.iter_content(chunk_size=8192):
+                        for chunk in pdf_response.iter_content(chunk_size=chunk_size):
                             if chunk:
                                 f.write(chunk)
+                                chunk_bytes += len(chunk)
+                                elapsed = time.time() - chunk_start_time
+                                if elapsed >= 1:  # Update speed every second
+                                    update_download_speed(chunk_bytes, elapsed)
+                                    chunk_bytes = 0
+                                    chunk_start_time = time.time()
                     os.rename(pdf_filename + ".tmp", pdf_filename)
                     file_size = os.path.getsize(pdf_filename) / (1024 ** 2)  # Convert to MB
                     logging.info(f"Downloaded {pdf_filename} ({file_size:.2f} MB)")
                     downloaded_files += 1
+                    # Small delay to avoid overwhelming the server
+                    time.sleep(1)
                 except Exception as e:
                     logging.error(f"Failed to download {pdf_url}: {str(e)}")
                     continue
@@ -954,6 +1242,8 @@ def scrape_dallas_police():
             logging.error(f"Error scraping page {page_num}: {str(e)}")
             break
     
+    # Clear the download speed at the end
+    clear_download_speed()
     logging.info(f"Dallas Police Archives scraping complete. Downloaded {downloaded_files} files.")
 
 if __name__ == "__main__":
