@@ -146,6 +146,7 @@ download_status_dict = {
     "download_speed": 0  # KB/s
 }
 download_status_lock = threading.Lock()
+download_in_progress = threading.Event()
 
 indexing_status_dict = {
     "in_progress": False,
@@ -662,7 +663,7 @@ def download_national_archives():
     """Download files from the National Archives, including 2025 release."""
     global download_status_dict
     # Set in_progress immediately to ensure the gauge reflects activity
-    download_status_dict["in_progress"] = True
+    download_in_progress.set()
     with download_status_lock:
         download_status_dict["start_time"] = time.time()
         download_status_dict["bytes_downloaded"] = 0
@@ -699,7 +700,7 @@ def download_national_archives():
                 continue
             
             logging.info(f"Downloading {download_url}...")
-            chunk_size = 8192
+            chunk_size = 4096  # Smaller chunk size to ensure streaming
             chunk_bytes = 0
             chunk_start_time = time.time()
             response = requests.get(download_url, stream=True)
@@ -711,13 +712,12 @@ def download_national_archives():
                         f.write(chunk)
                         chunk_bytes += len(chunk)
                         elapsed = time.time() - chunk_start_time
-                        if elapsed >= 0.1:  # Update speed more frequently (every 0.1 seconds)
-                            with download_status_lock:
-                                download_status_dict["bytes_downloaded"] += len(chunk)
-                                download_status_dict["download_speed"] = (chunk_bytes / 1024) / elapsed
-                                logging.info(f"Download speed: {download_status_dict['download_speed']:.2f} KB/s")
-                            chunk_bytes = 0
-                            chunk_start_time = time.time()
+                        with download_status_lock:
+                            download_status_dict["bytes_downloaded"] += len(chunk)
+                            download_status_dict["download_speed"] = (chunk_bytes / 1024) / elapsed if elapsed > 0 else 0
+                            logging.info(f"Download speed: {download_status_dict['download_speed']:.2f} KB/s")
+                        chunk_bytes = 0
+                        chunk_start_time = time.time()
             file_size = os.path.getsize(filename + ".tmp") / (1024 ** 2)  # Convert to MB
             os.rename(filename + ".tmp", filename)
             os.chmod(filename, 0o664)
@@ -749,24 +749,36 @@ def download_national_archives():
     except Exception as e:
         logging.error(f"Error downloading from National Archives: {str(e)}")
     finally:
-        # Keep the in_progress state for a few seconds to ensure the gauge displays the activity
+        # Keep the in_progress state for a minimum duration to ensure the gauge displays the activity
         time.sleep(5)
         with download_status_lock:
             download_status_dict["in_progress"] = False
             download_status_dict["download_speed"] = 0
-        download_status_dict["in_progress"] = False  # Ensure it's reset outside the lock
+        download_in_progress.clear()
 
 def run_dallas_police_scraper():
     """Run the scrape_texas_history.py script for Dallas Police Archives as the jfk user."""
     global download_status_dict
     # Set in_progress immediately to ensure the gauge reflects activity
-    download_status_dict["in_progress"] = True
+    download_in_progress.set()
     with download_status_lock:
         download_status_dict["start_time"] = time.time()
         download_status_dict["bytes_downloaded"] = 0
 
     logging.info("Starting Dallas Police Archives download...")
     try:
+        # Verify img2pdf binary permissions
+        img2pdf_path = shutil.which("img2pdf")
+        if img2pdf_path:
+            stat_info = os.stat(img2pdf_path)
+            perms = oct(stat_info.st_mode & 0o777)[2:]
+            uid = stat_info.st_uid
+            gid = stat_info.st_gid
+            logging.info(f"img2pdf binary at {img2pdf_path} - Permissions: {perms}, UID: {uid}, GID: {gid}")
+        else:
+            logging.error("img2pdf binary not found in PATH")
+            raise Exception("img2pdf binary not found")
+
         # Change to the dallas_police directory to run the scraper
         os.chdir(DALLAS_POLICE_DIR)
         # Run the scraper as the jfk user
@@ -778,7 +790,7 @@ def run_dallas_police_scraper():
         
         # Poll the speed log file while the subprocess is running
         while process.poll() is None:
-            download_status_dict["in_progress"] = True
+            download_in_progress.set()
             try:
                 with open(SPEED_LOG_FILE, 'r') as f:
                     speed_data = json.load(f)
@@ -802,12 +814,12 @@ def run_dallas_police_scraper():
     except Exception as e:
         logging.error(f"Error during Dallas Police download: {str(e)}")
     finally:
-        # Keep the in_progress state for a few seconds to ensure the gauge displays the activity
+        # Keep the in_progress state for a minimum duration to ensure the gauge displays the activity
         time.sleep(5)
         with download_status_lock:
             download_status_dict["in_progress"] = False
             download_status_dict["download_speed"] = 0
-        download_status_dict["in_progress"] = False  # Ensure it's reset outside the lock
+        download_in_progress.clear()
 
 @app.route('/')
 def index():
@@ -910,7 +922,7 @@ def download_status():
     logging.info("Handling request for /download_status")
     with download_status_lock:
         status = {
-            "in_progress": download_status_dict["in_progress"],
+            "in_progress": download_in_progress.is_set(),
             "download_speed": download_status_dict["download_speed"]  # KB/s
         }
     logging.info(f"Download status - In progress: {status['in_progress']}, Speed: {status['download_speed']} KB/s")
@@ -1235,7 +1247,7 @@ os.umask(0o022)
 
 def update_download_speed(bytes_downloaded, elapsed_time):
     """Update the download speed in a shared file."""
-    speed = (bytes_downloaded / 1024) / elapsed_time  # KB/s
+    speed = (bytes_downloaded / 1024) / elapsed_time if elapsed_time > 0 else 0  # KB/s
     try:
         with open(SPEED_LOG_FILE, 'w') as f:
             json.dump({"download_speed": speed}, f)
@@ -1288,7 +1300,7 @@ def scrape_dallas_police():
         try:
             logging.info(f"Scraping page {page_num}: {page_url}")
             # Fetch the collection page
-            chunk_size = 8192
+            chunk_size = 4096
             chunk_bytes = 0
             chunk_start_time = time.time()
             response = requests.get(page_url, stream=True)
@@ -1297,10 +1309,9 @@ def scrape_dallas_police():
                 if chunk:
                     chunk_bytes += len(chunk)
                     elapsed = time.time() - chunk_start_time
-                    if elapsed >= 0.1:  # Update speed more frequently
-                        update_download_speed(chunk_bytes, elapsed)
-                        chunk_bytes = 0
-                        chunk_start_time = time.time()
+                    update_download_speed(chunk_bytes, elapsed)
+                    chunk_bytes = 0
+                    chunk_start_time = time.time()
             soup = BeautifulSoup(response.text, 'html.parser')
             
             # Find all document links with 'metapth' identifiers
@@ -1308,11 +1319,11 @@ def scrape_dallas_police():
             for link in doc_links:
                 doc_url = urljoin(BASE_URL, link['href'])
                 metapth_id = doc_url.split('/')[-2]  # Extract the metapth ID (e.g., metapth338772)
-                pdf_filename = os.path.join(SAVE_DIR, f"{metapth_id}.pdf")
+                pdf_filename = os.path.join(SAVE_DIR, f"output_{metapth_id}.pdf")
                 
                 # Skip if the file already exists
                 if os.path.exists(pdf_filename) and os.path.getsize(pdf_filename) > 0:
-                    logging.info(f"Skipping existing file: {pdf_filename}")
+                    logging.info(f"PDF already exists for {metapth_id} at {pdf_filename}, skipping")
                     # Simulate a small "download" by fetching the page to keep the gauge active
                     chunk_bytes = 0
                     chunk_start_time = time.time()
@@ -1322,99 +1333,83 @@ def scrape_dallas_police():
                     time.sleep(1)  # Delay to keep gauge active
                     continue
                 
-                # Download the PDF
-                logging.info(f"Downloading {doc_url} to {pdf_filename}...")
+                # Scrape the document page
+                logging.info(f"Scraping URL: {doc_url}")
                 try:
                     chunk_bytes = 0
                     chunk_start_time = time.time()
-                    pdf_response = requests.get(f"{doc_url}m1/1/?layout=pdf", stream=True)
-                    pdf_response.raise_for_status()
+                    page_response = requests.get(doc_url)
+                    page_response.raise_for_status()
+                    page_soup = BeautifulSoup(page_response.text, 'html.parser')
                     
-                    with open(pdf_filename + ".tmp", 'wb') as f:
-                        for chunk in pdf_response.iter_content(chunk_size=chunk_size):
-                            if chunk:
-                                f.write(chunk)
-                                chunk_bytes += len(chunk)
-                                elapsed = time.time() - chunk_start_time
-                                if elapsed >= 0.1:  # Update speed more frequently
-                                    update_download_speed(chunk_bytes, elapsed)
-                                    chunk_bytes = 0
-                                    chunk_start_time = time.time()
-                    os.rename(pdf_filename + ".tmp", pdf_filename)
-                    os.chmod(pdf_filename, 0o664)
-                    os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
-                    log_file_permissions(pdf_filename)
-                    file_size = os.path.getsize(pdf_filename) / (1024 ** 2)  # Convert to MB
-                    logging.info(f"Downloaded {pdf_filename} ({file_size:.2f} MB)")
-                    downloaded_files += 1
-                    time.sleep(1)  # Delay to keep gauge active
-                except Exception as e:
-                    logging.error(f"Failed to download {doc_url}: {str(e)}")
-                    # Try downloading individual pages as a fallback
-                    try:
-                        chunk_bytes = 0
-                        chunk_start_time = time.time()
-                        page_response = requests.get(doc_url)
-                        page_response.raise_for_status()
-                        page_soup = BeautifulSoup(page_response.text, 'html.parser')
-                        # Look for IIIF manifest or page links
-                        iiif_link = page_soup.find('a', href=re.compile(r'/ark:/67531/metapth\d+/iiif'))
-                        if iiif_link:
-                            iiif_manifest_url = urljoin(BASE_URL, iiif_link['href']) + '/manifest.json'
-                            manifest_response = requests.get(iiif_manifest_url)
-                            manifest_response.raise_for_status()
-                            manifest = manifest_response.json()
-                            pages = manifest.get('sequences', [{}])[0].get('canvases', [])
-                            logging.info(f"Item has {len(pages)} pages according to IIIF manifest")
-                            images = []
-                            temp_dir = os.path.join(SAVE_DIR, f"temp_{metapth_id}")
-                            os.makedirs(temp_dir, exist_ok=True)
-                            os.chmod(temp_dir, 0o775)
-                            os.chown(temp_dir, 1000, 1000)  # Assuming jfk user has UID/GID 1000
-                            log_file_permissions(temp_dir)
-                            try:
-                                for i, canvas in enumerate(pages):
-                                    image_url = canvas['images'][0]['resource']['@id']
-                                    # Look for high_res_d link
-                                    high_res_url = image_url.replace('/full/full/0/default.jpg', '/full/high_res_d/')
-                                    logging.info(f"Found downloadable link (high_res_d): {high_res_url}")
-                                    image_response = requests.get(high_res_url, stream=True)
-                                    image_response.raise_for_status()
-                                    image_path = os.path.join(temp_dir, f"temp_image_{i}.jpg")
-                                    with open(image_path, 'wb') as img_f:
-                                        for chunk in image_response.iter_content(chunk_size=chunk_size):
-                                            if chunk:
-                                                img_f.write(chunk)
-                                                chunk_bytes += len(chunk)
-                                                elapsed = time.time() - chunk_start_time
-                                                if elapsed >= 0.1:
-                                                    update_download_speed(chunk_bytes, elapsed)
-                                                    chunk_bytes = 0
-                                                    chunk_start_time = time.time()
+                    # Check for "View Extracted Text" link
+                    text_link = page_soup.find('a', string=re.compile(r'View Extracted Text', re.I))
+                    if text_link:
+                        logging.info("No 'View Extracted Text' link found")
+                    
+                    # Look for IIIF manifest or page links
+                    iiif_link = page_soup.find('a', href=re.compile(r'/ark:/67531/metapth\d+/iiif'))
+                    if iiif_link:
+                        iiif_manifest_url = urljoin(BASE_URL, iiif_link['href']) + '/manifest.json'
+                        manifest_response = requests.get(iiif_manifest_url)
+                        manifest_response.raise_for_status()
+                        manifest = manifest_response.json()
+                        pages = manifest.get('sequences', [{}])[0].get('canvases', [])
+                        logging.info(f"Item has {len(pages)} pages according to IIIF manifest")
+                        images = []
+                        temp_dir = os.path.join(SAVE_DIR, f"temp_{metapth_id}")
+                        os.makedirs(temp_dir, exist_ok=True)
+                        os.chmod(temp_dir, 0o775)
+                        os.chown(temp_dir, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                        log_file_permissions(temp_dir)
+                        try:
+                            for i, canvas in enumerate(pages):
+                                image_url = canvas['images'][0]['resource']['@id']
+                                # Look for high_res_d link
+                                high_res_url = image_url.replace('/full/full/0/default.jpg', '/full/high_res_d/')
+                                logging.info(f"Found downloadable link (high_res_d): {high_res_url}")
+                                image_response = requests.get(high_res_url, stream=True)
+                                image_response.raise_for_status()
+                                image_path = os.path.join(temp_dir, f"temp_image_{i}.jpg")
+                                logging.info(f"Creating image file at {image_path}")
+                                with open(image_path, 'wb') as img_f:
                                     os.chmod(image_path, 0o664)
-                                    os.chown(image_path, 1000, 1000)  # Assuming jfk user has UID/GID 1000
-                                    log_file_permissions(image_path)  # Log permissions for debugging
-                                    images.append(image_path)
-                                    time.sleep(0.5)
-                                logging.info("Using /high_res_d/ links, skipping other sources")
-                                # Convert images to PDF
-                                if images:
-                                    cmd = ["img2pdf"] + images + ["-o", pdf_filename]
-                                    subprocess.run(cmd, check=True)
-                                    os.chmod(pdf_filename, 0o664)
-                                    os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
-                                    log_file_permissions(pdf_filename)
-                                    file_size = os.path.getsize(pdf_filename) / (1024 ** 2)
-                                    logging.info(f"Created PDF {pdf_filename} from images ({file_size:.2f} MB)")
-                                    downloaded_files += 1
-                            except Exception as e:
-                                logging.error(f"Error converting images to PDF: {str(e)}")
-                            finally:
-                                time.sleep(1)
-                                shutil.rmtree(temp_dir, ignore_errors=True)
-                    except Exception as e:
-                        logging.error(f"Fallback download failed for {doc_url}: {str(e)}")
+                                    os.chown(image_path, 1000, 1000)  # Set ownership immediately
+                                    log_file_permissions(image_path)
+                                    for chunk in image_response.iter_content(chunk_size=chunk_size):
+                                        if chunk:
+                                            img_f.write(chunk)
+                                            chunk_bytes += len(chunk)
+                                            elapsed = time.time() - chunk_start_time
+                                            update_download_speed(chunk_bytes, elapsed)
+                                            chunk_bytes = 0
+                                            chunk_start_time = time.time()
+                                log_file_permissions(image_path)  # Log permissions after writing
+                                images.append(image_path)
+                                time.sleep(0.5)
+                            logging.info("Using /high_res_d/ links, skipping other sources")
+                            # Convert images to PDF
+                            if images:
+                                logging.info(f"Converting images to PDF: {images}")
+                                cmd = ["img2pdf"] + images + ["-o", pdf_filename]
+                                subprocess.run(cmd, check=True)
+                                os.chmod(pdf_filename, 0o664)
+                                os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                                log_file_permissions(pdf_filename)
+                                file_size = os.path.getsize(pdf_filename) / (1024 ** 2)
+                                logging.info(f"Created PDF {pdf_filename} from images ({file_size:.2f} MB)")
+                                downloaded_files += 1
+                        except Exception as e:
+                            logging.error(f"Error converting images to PDF: {str(e)}")
+                        finally:
+                            time.sleep(1)
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                    else:
+                        logging.warning(f"No IIIF manifest found for {doc_url}, skipping")
                         continue
+                except Exception as e:
+                    logging.error(f"Fallback download failed for {doc_url}: {str(e)}")
+                    continue
             
             # Find the "Next" page link
             next_link = soup.find('a', string=re.compile(r'Next', re.I))

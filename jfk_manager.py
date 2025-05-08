@@ -56,6 +56,7 @@ download_status_dict = {
     "download_speed": 0  # KB/s
 }
 download_status_lock = threading.Lock()
+download_in_progress = threading.Event()
 
 indexing_status_dict = {
     "in_progress": False,
@@ -572,7 +573,7 @@ def download_national_archives():
     """Download files from the National Archives, including 2025 release."""
     global download_status_dict
     # Set in_progress immediately to ensure the gauge reflects activity
-    download_status_dict["in_progress"] = True
+    download_in_progress.set()
     with download_status_lock:
         download_status_dict["start_time"] = time.time()
         download_status_dict["bytes_downloaded"] = 0
@@ -609,7 +610,7 @@ def download_national_archives():
                 continue
             
             logging.info(f"Downloading {download_url}...")
-            chunk_size = 8192
+            chunk_size = 4096  # Smaller chunk size to ensure streaming
             chunk_bytes = 0
             chunk_start_time = time.time()
             response = requests.get(download_url, stream=True)
@@ -621,13 +622,12 @@ def download_national_archives():
                         f.write(chunk)
                         chunk_bytes += len(chunk)
                         elapsed = time.time() - chunk_start_time
-                        if elapsed >= 0.1:  # Update speed more frequently (every 0.1 seconds)
-                            with download_status_lock:
-                                download_status_dict["bytes_downloaded"] += len(chunk)
-                                download_status_dict["download_speed"] = (chunk_bytes / 1024) / elapsed
-                                logging.info(f"Download speed: {download_status_dict['download_speed']:.2f} KB/s")
-                            chunk_bytes = 0
-                            chunk_start_time = time.time()
+                        with download_status_lock:
+                            download_status_dict["bytes_downloaded"] += len(chunk)
+                            download_status_dict["download_speed"] = (chunk_bytes / 1024) / elapsed if elapsed > 0 else 0
+                            logging.info(f"Download speed: {download_status_dict['download_speed']:.2f} KB/s")
+                        chunk_bytes = 0
+                        chunk_start_time = time.time()
             file_size = os.path.getsize(filename + ".tmp") / (1024 ** 2)  # Convert to MB
             os.rename(filename + ".tmp", filename)
             os.chmod(filename, 0o664)
@@ -659,24 +659,36 @@ def download_national_archives():
     except Exception as e:
         logging.error(f"Error downloading from National Archives: {str(e)}")
     finally:
-        # Keep the in_progress state for a few seconds to ensure the gauge displays the activity
+        # Keep the in_progress state for a minimum duration to ensure the gauge displays the activity
         time.sleep(5)
         with download_status_lock:
             download_status_dict["in_progress"] = False
             download_status_dict["download_speed"] = 0
-        download_status_dict["in_progress"] = False  # Ensure it's reset outside the lock
+        download_in_progress.clear()
 
 def run_dallas_police_scraper():
     """Run the scrape_texas_history.py script for Dallas Police Archives as the jfk user."""
     global download_status_dict
     # Set in_progress immediately to ensure the gauge reflects activity
-    download_status_dict["in_progress"] = True
+    download_in_progress.set()
     with download_status_lock:
         download_status_dict["start_time"] = time.time()
         download_status_dict["bytes_downloaded"] = 0
 
     logging.info("Starting Dallas Police Archives download...")
     try:
+        # Verify img2pdf binary permissions
+        img2pdf_path = shutil.which("img2pdf")
+        if img2pdf_path:
+            stat_info = os.stat(img2pdf_path)
+            perms = oct(stat_info.st_mode & 0o777)[2:]
+            uid = stat_info.st_uid
+            gid = stat_info.st_gid
+            logging.info(f"img2pdf binary at {img2pdf_path} - Permissions: {perms}, UID: {uid}, GID: {gid}")
+        else:
+            logging.error("img2pdf binary not found in PATH")
+            raise Exception("img2pdf binary not found")
+
         # Change to the dallas_police directory to run the scraper
         os.chdir(DALLAS_POLICE_DIR)
         # Run the scraper as the jfk user
@@ -688,7 +700,7 @@ def run_dallas_police_scraper():
         
         # Poll the speed log file while the subprocess is running
         while process.poll() is None:
-            download_status_dict["in_progress"] = True
+            download_in_progress.set()
             try:
                 with open(SPEED_LOG_FILE, 'r') as f:
                     speed_data = json.load(f)
@@ -712,12 +724,12 @@ def run_dallas_police_scraper():
     except Exception as e:
         logging.error(f"Error during Dallas Police download: {str(e)}")
     finally:
-        # Keep the in_progress state for a few seconds to ensure the gauge displays the activity
+        # Keep the in_progress state for a minimum duration to ensure the gauge displays the activity
         time.sleep(5)
         with download_status_lock:
             download_status_dict["in_progress"] = False
             download_status_dict["download_speed"] = 0
-        download_status_dict["in_progress"] = False  # Ensure it's reset outside the lock
+        download_in_progress.clear()
 
 @app.route('/')
 def index():
@@ -820,7 +832,7 @@ def download_status():
     logging.info("Handling request for /download_status")
     with download_status_lock:
         status = {
-            "in_progress": download_status_dict["in_progress"],
+            "in_progress": download_in_progress.is_set(),
             "download_speed": download_status_dict["download_speed"]  # KB/s
         }
     logging.info(f"Download status - In progress: {status['in_progress']}, Speed: {status['download_speed']} KB/s")
