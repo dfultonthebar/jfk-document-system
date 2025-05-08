@@ -978,8 +978,8 @@ chmod +x "$JFK_MANAGER_PATH"
 chown jfk:jfk "$JFK_MANAGER_PATH"
 chmod 775 "$JFK_MANAGER_PATH"
 
-# Step 7.1: Create the index.html template with a download speed gauge
-echo "Step 7.1: Creating index.html with download speed gauge..."
+# Step 7.1: Create the index.html template with gauges for Download Speed, CPU, Indexer, Memory, and GPU
+echo "Step 7.1: Creating index.html with gauges..."
 mkdir -p "$TEMPLATES_DIR"
 cat > "$TEMPLATES_DIR/index.html" << 'EOF'
 <!DOCTYPE html>
@@ -1005,6 +1005,7 @@ cat > "$TEMPLATES_DIR/index.html" << 'EOF'
             width: 300px;
             height: 200px;
             margin: 20px 0;
+            display: inline-block;
         }
         .file-list {
             list-style-type: none;
@@ -1050,7 +1051,7 @@ cat > "$TEMPLATES_DIR/index.html" << 'EOF'
             overflow-y: auto;
         }
     </style>
-    <!-- Include JustGage and Raphael for the gauge -->
+    <!-- Include JustGage and Raphael for the gauges -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/raphael/2.3.0/raphael.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/justgage/1.2.2/justgage.min.js"></script>
 </head>
@@ -1063,10 +1064,16 @@ cat > "$TEMPLATES_DIR/index.html" << 'EOF'
         <div id="download-gauge" class="gauge"></div>
         <p id="download-status">Download in progress: <span id="download-in-progress">No</span></p>
         
-        <!-- Indexing Status -->
-        <h2>Indexing Status</h2>
-        <p>Indexing in progress: <span id="indexing-in-progress">No</span></p>
-        <p>Progress: <span id="indexing-progress">0%</span> (<span id="files-processed">0</span>/<span id="total-files">0</span>)</p>
+        <!-- Indexing Status Gauge -->
+        <h2>Indexer Status</h2>
+        <div id="indexing-gauge" class="gauge"></div>
+        <p>Indexing in progress: <span id="indexing-in-progress">No</span> (<span id="files-processed">0</span>/<span id="total-files">0</span>)</p>
+        
+        <!-- System Metrics Gauges -->
+        <h2>System Metrics</h2>
+        <div id="cpu-gauge" class="gauge"></div>
+        <div id="memory-gauge" class="gauge"></div>
+        <div id="gpu-gauge" class="gauge"></div>
         
         <!-- File List -->
         <h2>Available Files</h2>
@@ -1084,20 +1091,14 @@ cat > "$TEMPLATES_DIR/index.html" << 'EOF'
         </div>
         <div id="search-results"></div>
         
-        <!-- System Metrics -->
-        <h2>System Metrics</h2>
-        <p>CPU Usage: <span id="cpu-usage">0%</span></p>
-        <p>Memory Usage: <span id="memory-usage">0%</span></p>
-        <p>GPU Usage: <span id="gpu-usage">0%</span></p>
-        
         <!-- Logs -->
         <h2>Recent Logs</h2>
         <div class="log-box" id="logs"></div>
     </div>
 
     <script>
-        // Initialize the gauge
-        let gauge = new JustGage({
+        // Initialize the Download Speed gauge
+        let downloadGauge = new JustGage({
             id: "download-gauge",
             value: 0,
             min: 0,
@@ -1108,11 +1109,99 @@ cat > "$TEMPLATES_DIR/index.html" << 'EOF'
             levelColors: ["#ff0000", "#f9c802", "#00ff00"],
             decimals: 2,
             customSectors: {
-                percents: true,  // Use percentage-based sectors
+                percents: true,
                 ranges: [
                     { from: 0, to: 20, color: "#ff0000" },  // 0-30,000 KB/s
                     { from: 20, to: 60, color: "#f9c802" },  // 30,000-90,000 KB/s
                     { from: 60, to: 100, color: "#00ff00" }  // 90,000-150,000 KB/s
+                ]
+            },
+            counter: true
+        });
+
+        // Initialize the Indexing Progress gauge
+        let indexingGauge = new JustGage({
+            id: "indexing-gauge",
+            value: 0,
+            min: 0,
+            max: 100,
+            title: "Indexing Progress",
+            label: "%",
+            gaugeWidthScale: 0.6,
+            levelColors: ["#ff0000", "#f9c802", "#00ff00"],
+            decimals: 2,
+            customSectors: {
+                percents: true,
+                ranges: [
+                    { from: 0, to: 33, color: "#ff0000" },
+                    { from: 33, to: 66, color: "#f9c802" },
+                    { from: 66, to: 100, color: "#00ff00" }
+                ]
+            },
+            counter: true
+        });
+
+        // Initialize the CPU Usage gauge
+        let cpuGauge = new JustGage({
+            id: "cpu-gauge",
+            value: 0,
+            min: 0,
+            max: 100,
+            title: "CPU Usage",
+            label: "%",
+            gaugeWidthScale: 0.6,
+            levelColors: ["#00ff00", "#f9c802", "#ff0000"],
+            decimals: 2,
+            customSectors: {
+                percents: true,
+                ranges: [
+                    { from: 0, to: 33, color: "#00ff00" },
+                    { from: 33, to: 66, color: "#f9c802" },
+                    { from: 66, to: 100, color: "#ff0000" }
+                ]
+            },
+            counter: true
+        });
+
+        // Initialize the Memory Usage gauge
+        let memoryGauge = new JustGage({
+            id: "memory-gauge",
+            value: 0,
+            min: 0,
+            max: 100,
+            title: "Memory Usage",
+            label: "%",
+            gaugeWidthScale: 0.6,
+            levelColors: ["#00ff00", "#f9c802", "#ff0000"],
+            decimals: 2,
+            customSectors: {
+                percents: true,
+                ranges: [
+                    { from: 0, to: 33, color: "#00ff00" },
+                    { from: 33, to: 66, color: "#f9c802" },
+                    { from: 66, to: 100, color: "#ff0000" }
+                ]
+            },
+            counter: true
+        });
+
+        // Initialize the GPU Usage gauge
+        let gpuGauge = new JustGage({
+            id: "gpu-gauge",
+            value: 0,
+            min: 0,
+            max: 100,
+            title: "GPU Usage",
+            label: "%",
+            gaugeWidthScale: 0.6,
+            levelColors: ["#00ff00", "#f9c802", "#ff0000"],
+            decimals: 2,
+            customSectors: {
+                percents: true,
+                ranges: [
+                    { from: 0, to: 33, color: "#00ff00" },
+                    { from: 33, to: 66, color: "#f9c802" },
+                    { from: 66, to: 100, color: "#ff0000" }
                 ]
             },
             counter: true
@@ -1124,32 +1213,32 @@ cat > "$TEMPLATES_DIR/index.html" << 'EOF'
                 .then(response => response.json())
                 .then(data => {
                     document.getElementById('download-in-progress').textContent = data.in_progress ? "Yes" : "No";
-                    gauge.refresh(data.download_speed);
+                    downloadGauge.refresh(data.download_speed);
                 })
                 .catch(error => console.error('Error fetching download status:', error));
         }
 
-        // Function to update the indexing status
+        // Function to update the indexing status and gauge
         function updateIndexingStatus() {
             fetch('/indexing_status')
                 .then(response => response.json())
                 .then(data => {
                     document.getElementById('indexing-in-progress').textContent = data.in_progress ? "Yes" : "No";
-                    document.getElementById('indexing-progress').textContent = data.progress.toFixed(2) + '%';
                     document.getElementById('files-processed').textContent = data.files_processed;
                     document.getElementById('total-files').textContent = data.total_files;
+                    indexingGauge.refresh(data.progress);
                 })
                 .catch(error => console.error('Error fetching indexing status:', error));
         }
 
-        // Function to update system metrics
+        // Function to update system metrics and gauges
         function updateSystemMetrics() {
             fetch('/system_metrics')
                 .then(response => response.json())
                 .then(data => {
-                    document.getElementById('cpu-usage').textContent = data.cpu_usage.toFixed(2) + '%';
-                    document.getElementById('memory-usage').textContent = data.memory_usage.toFixed(2) + '%';
-                    document.getElementById('gpu-usage').textContent = data.gpu_usage.toFixed(2) + '%';
+                    cpuGauge.refresh(data.cpu_usage);
+                    memoryGauge.refresh(data.memory_usage);
+                    gpuGauge.refresh(data.gpu_usage);
                 })
                 .catch(error => console.error('Error fetching system metrics:', error));
         }
@@ -1495,15 +1584,8 @@ git push origin main
 cd "$BASE_DIR"
 echo "Initial files uploaded to GitHub repository at $REPO_URL."
 
-# Step 13: Run the download process
-echo "Step 13: Running the download process for National Archives and Dallas Police Archives..."
-source "$VENV_DIR/bin/activate"
-python "$JFK_MANAGER_PATH" download
-deactivate
-echo "Download process completed. Check logs for details."
-
-# Step 14: Set up the Flask systemd service
-echo "Step 14: Setting up Flask systemd service..."
+# Step 13: Set up the Flask systemd service
+echo "Step 13: Setting up Flask systemd service..."
 cat > /etc/systemd/system/jfk-flask.service << 'EOF'
 [Unit]
 Description=JFK Flask Web Interface
@@ -1520,8 +1602,8 @@ Environment="FLASK_APP=jfk_manager.py"
 WantedBy=multi-user.target
 EOF
 
-# Step 15: Set up the indexing systemd service
-echo "Step 15: Setting up indexing systemd service..."
+# Step 14: Set up the indexing systemd service
+echo "Step 14: Setting up indexing systemd service..."
 cat > /etc/systemd/system/jfk-index.service << 'EOF'
 [Unit]
 Description=JFK Indexing Service
@@ -1539,14 +1621,21 @@ StandardError=append:/jfk_data/indexing.log
 WantedBy=multi-user.target
 EOF
 
-# Step 16: Reload systemd, enable, and start the services
-echo "Step 16: Enabling and starting systemd services..."
+# Step 15: Reload systemd, enable, and start the services
+echo "Step 15: Enabling and starting systemd services..."
 systemctl daemon-reload
 systemctl enable jfk-flask.service
 systemctl enable jfk-index.service
 systemctl start jfk-flask.service
 systemctl start jfk-index.service
 echo "Systemd services enabled and started."
+
+# Step 16: Run the download process
+echo "Step 16: Running the download process for National Archives and Dallas Police Archives..."
+source "$VENV_DIR/bin/activate"
+python "$JFK_MANAGER_PATH" download
+deactivate
+echo "Download process completed. Check logs for details."
 
 # Step 17: Set up a daily cron job to rotate and upload log files to GitHub
 echo "Step 17: Setting up daily cron job to rotate and upload log files to GitHub..."
@@ -1617,9 +1706,9 @@ chmod 775 "$CRON_SCRIPT"
 (crontab -l 2>/dev/null; echo "0 0 * * * $CRON_SCRIPT") | crontab -
 echo "Cron job set up to rotate and upload log files daily at midnight to GitHub."
 
+# Final installation message
 echo "Installation complete! The JFK document management system is fully set up and running."
 echo "The system will automatically start on boot."
 echo "Access the web interface at http://192.168.1.176:5000"
 echo "Monitor indexing progress with: tail -f $LOG_PATH"
-echo "Files and logs are being uploaded to GitHub at $REPO_URL."
-echo "Log rotation and uploads will occur daily at midnight."
+echo "Files and logs are being uploaded to GitHub at
