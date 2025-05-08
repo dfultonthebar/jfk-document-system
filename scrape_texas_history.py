@@ -51,6 +51,7 @@ def scrape_dallas_police():
     # Ensure the save directory exists
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.chmod(SAVE_DIR, 0o775)
+    os.chown(SAVE_DIR, 1000, 1000)  # Assuming jfk user has UID/GID 1000
     
     # Clear the download speed at the start
     clear_download_speed()
@@ -74,7 +75,7 @@ def scrape_dallas_police():
                 if chunk:
                     chunk_bytes += len(chunk)
                     elapsed = time.time() - chunk_start_time
-                    if elapsed >= 1:  # Update speed every second
+                    if elapsed >= 0.5:  # Update speed every 0.5 seconds
                         update_download_speed(chunk_bytes, elapsed)
                         chunk_bytes = 0
                         chunk_start_time = time.time()
@@ -96,7 +97,7 @@ def scrape_dallas_police():
                     requests.head(doc_url)
                     elapsed = time.time() - chunk_start_time
                     update_download_speed(1024, elapsed)  # Simulate 1 KB download
-                    time.sleep(0.5)  # Small delay to keep gauge active
+                    time.sleep(1)  # Delay to keep gauge active
                     continue
                 
                 # Download the PDF
@@ -113,16 +114,17 @@ def scrape_dallas_police():
                                 f.write(chunk)
                                 chunk_bytes += len(chunk)
                                 elapsed = time.time() - chunk_start_time
-                                if elapsed >= 1:  # Update speed every second
+                                if elapsed >= 0.5:  # Update speed every 0.5 seconds
                                     update_download_speed(chunk_bytes, elapsed)
                                     chunk_bytes = 0
                                     chunk_start_time = time.time()
                     os.rename(pdf_filename + ".tmp", pdf_filename)
                     os.chmod(pdf_filename, 0o664)
+                    os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                     file_size = os.path.getsize(pdf_filename) / (1024 ** 2)  # Convert to MB
                     logging.info(f"Downloaded {pdf_filename} ({file_size:.2f} MB)")
                     downloaded_files += 1
-                    time.sleep(1)  # Small delay to avoid overwhelming the server
+                    time.sleep(1)  # Delay to keep gauge active
                 except Exception as e:
                     logging.error(f"Failed to download {doc_url}: {str(e)}")
                     # Try downloading individual pages as a fallback
@@ -145,6 +147,7 @@ def scrape_dallas_police():
                             temp_dir = os.path.join(SAVE_DIR, f"temp_{metapth_id}")
                             os.makedirs(temp_dir, exist_ok=True)
                             os.chmod(temp_dir, 0o775)
+                            os.chown(temp_dir, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                             try:
                                 for i, canvas in enumerate(pages):
                                     image_url = canvas['images'][0]['resource']['@id']
@@ -160,21 +163,21 @@ def scrape_dallas_police():
                                                 img_f.write(chunk)
                                                 chunk_bytes += len(chunk)
                                                 elapsed = time.time() - chunk_start_time
-                                                if elapsed >= 1:
+                                                if elapsed >= 0.5:
                                                     update_download_speed(chunk_bytes, elapsed)
                                                     chunk_bytes = 0
                                                     chunk_start_time = time.time()
                                     os.chmod(image_path, 0o664)
+                                    os.chown(image_path, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                                     images.append(image_path)
                                     time.sleep(0.5)
                                 logging.info("Using /high_res_d/ links, skipping other sources")
-                                # Convert images to PDF
+                                # Convert images to PDF as the jfk user
                                 if images:
-                                    subprocess.run(
-                                        ["img2pdf"] + images + ["-o", pdf_filename],
-                                        check=True
-                                    )
+                                    cmd = ["sudo", "-u", "jfk", "img2pdf"] + images + ["-o", pdf_filename]
+                                    subprocess.run(cmd, check=True)
                                     os.chmod(pdf_filename, 0o664)
+                                    os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                                     file_size = os.path.getsize(pdf_filename) / (1024 ** 2)
                                     logging.info(f"Created PDF {pdf_filename} from images ({file_size:.2f} MB)")
                                     downloaded_files += 1

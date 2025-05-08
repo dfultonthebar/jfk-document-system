@@ -26,7 +26,7 @@ SCRIPT_PATH="$(realpath "$0")"
 # Step 1: Install system dependencies
 echo "Step 1: Installing system dependencies..."
 apt-get update
-apt-get install -y python3 python3-venv python3-pip mysql-server poppler-utils git
+apt-get install -y python3 python3-venv python3-pip mysql-server poppler-utils git img2pdf
 
 # Step 2: Set up MySQL database and user
 echo "Step 2: Setting up MySQL database and user..."
@@ -276,6 +276,7 @@ def extract_metadata(pdf_path, max_retries=2):
                 temp_dir = os.path.join(BASE_DIR, f"temp_metadata_{os.path.basename(pdf_path).replace('.pdf', '')}")
                 os.makedirs(temp_dir, exist_ok=True)
                 os.chmod(temp_dir, 0o775)
+                os.chown(temp_dir, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                 try:
                     output_prefix = os.path.join(temp_dir, "page")
                     subprocess.run(
@@ -300,6 +301,7 @@ def extract_metadata(pdf_path, max_retries=2):
                     for page_image in page_images:
                         image_path = os.path.join(temp_dir, page_image)
                         os.chmod(image_path, 0o664)
+                        os.chown(image_path, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                         # Validate the image
                         is_valid, reason = validate_image(image_path)
                         if not is_valid:
@@ -468,154 +470,165 @@ def index_files(limit=None):
                     cursor = conn.cursor()
                     continue
                 
-                logging.info(f"Indexing {pdf_file}...")
-                
-                # Extract metadata
-                metadata = extract_metadata(pdf_path)
-                if metadata is None:
-                    logging.warning(f"Failed to extract metadata for {pdf_file}. Skipping file.")
-                    indexing_status_dict["files_processed"] += 1
-                    indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
-                    save_indexing_status()
-                    continue
-                
-                # Create a temporary directory for page images
-                temp_dir = os.path.join(BASE_DIR, f"temp_{item_id}")
-                os.makedirs(temp_dir, exist_ok=True)
-                os.chmod(temp_dir, 0o775)
-                page_images = []
-                try:
-                    # Convert PDF to images using pdftoppm
-                    output_prefix = os.path.join(temp_dir, "page")
-                    try:
-                        result = subprocess.run(
-                            ["pdftoppm", "-jpeg", pdf_path, output_prefix],
-                            check=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True
-                        )
-                        logging.debug(f"pdftoppm stdout: {result.stdout}")
-                        logging.debug(f"pdftoppm stderr: {result.stderr}")
-                    except subprocess.CalledProcessError as e:
-                        logging.error(f"pdftoppm failed for {pdf_file}: {e.stderr}")
+                # Check if OCR text already exists
+                ocr_path = os.path.join(BASE_DIR, f"ocr_{item_id}.txt")
+                if os.path.exists(ocr_path) and os.path.getsize(ocr_path) > 0:
+                    logging.info(f"Skipping OCR for {pdf_file}, using existing OCR text: {ocr_path}")
+                    with open(ocr_path, 'r') as f:
+                        content = f.read()
+                else:
+                    logging.info(f"Indexing {pdf_file}...")
+                    
+                    # Extract metadata
+                    metadata = extract_metadata(pdf_path)
+                    if metadata is None:
+                        logging.warning(f"Failed to extract metadata for {pdf_file}. Skipping file.")
                         indexing_status_dict["files_processed"] += 1
                         indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
                         save_indexing_status()
                         continue
                     
-                    # Find all generated images (pdftoppm names them page-001.jpg, page-002.jpg, etc.)
-                    for f in os.listdir(temp_dir):
-                        if f.endswith('.jpg'):
-                            # Normalize the file name for consistent sorting
-                            page_num = f.split('-')[1].split('.jpg')[0]
-                            page_num = int(page_num.lstrip('0') or '0')  # Handle page-000.jpg
-                            page_images.append((f, page_num))
-                    page_images.sort(key=lambda x: x[1])  # Sort by page number
-                    page_images = [f[0] for f in page_images]  # Keep only the filenames
-                    
-                    # Limit the number of pages to reduce memory usage (first 3 pages only)
-                    page_images = page_images[:3]
-                    
-                    if not page_images:
-                        logging.error(f"No images generated by pdftoppm for {pdf_file}")
-                        indexing_status_dict["files_processed"] += 1
-                        indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
-                        save_indexing_status()
-                        continue
-                    
-                    # Perform OCR on each page using EasyOCR (CPU-only)
-                    ocr_text = []
-                    max_retries = 2
-                    for i, page_image in enumerate(page_images):
-                        image_path = os.path.join(temp_dir, page_image)
-                        os.chmod(image_path, 0o664)
-                        # Validate the image
-                        is_valid, reason = validate_image(image_path)
-                        if not is_valid:
-                            logging.warning(f"Skipping image {image_path}: {reason}")
-                            continue
-                        for attempt in range(max_retries):
-                            try:
-                                # Log system resources before OCR
-                                log_system_resources()
-                                # Add timeout for OCR operation
-                                def timeout_handler(signum, frame):
-                                    raise TimeoutError("OCR operation timed out")
-                                signal.signal(signal.SIGALRM, timeout_handler)
-                                signal.alarm(60)  # Set a 60-second timeout
-                                result = reader.readtext(image_path, detail=0)
-                                signal.alarm(0)  # Disable the alarm
-                                text = " ".join(result).strip()
-                                if text:
-                                    ocr_text.append(f"Page {i+1}:\n{text}\n{'='*80}")
-                                break  # Success, exit retry loop
-                            except TimeoutError as e:
-                                logging.error(f"OCR timed out for {image_path}: {str(e)}")
-                                if attempt < max_retries - 1:
-                                    logging.info("Retrying OCR on next attempt...")
-                                    time.sleep(5)
-                                    continue
-                                else:
-                                    logging.warning(f"Max retries reached for OCR on {image_path}. Skipping page.")
-                                    break
-                            except Exception as e:
-                                logging.error(f"Error performing OCR on {image_path} (attempt {attempt+1}/{max_retries}): {str(e)}")
-                                if attempt < max_retries - 1:
-                                    logging.info("Retrying OCR on next attempt...")
-                                    time.sleep(5)
-                                    continue
-                                else:
-                                    logging.warning(f"Max retries reached for OCR on {image_path}. Skipping page.")
-                                    break
-                            finally:
-                                time.sleep(2)  # Delay to prevent CPU overload
-                    
-                    # Save OCR text
-                    ocr_path = os.path.join(BASE_DIR, f"ocr_{item_id}.txt")
-                    with open(ocr_path, 'w') as f:
-                        f.write('\n'.join(ocr_text))
-                    
-                    # Store in MySQL with metadata
-                    content = '\n'.join(ocr_text)
+                    # Create a temporary directory for page images
+                    temp_dir = os.path.join(BASE_DIR, f"temp_{item_id}")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    os.chmod(temp_dir, 0o775)
+                    os.chown(temp_dir, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                    page_images = []
                     try:
-                        cursor.execute(
-                            """
-                            INSERT INTO files (id, filename, content, index_time, date, time, location, mission_names)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                            ON DUPLICATE KEY UPDATE
-                                content=%s, index_time=%s, date=%s, time=%s, location=%s, mission_names=%s
-                            """,
-                            (
-                                item_id, pdf_file, content, datetime.now(),
-                                metadata["date"], metadata["time"], metadata["location"], metadata["mission_names"],
-                                content, datetime.now(),
-                                metadata["date"], metadata["time"], metadata["location"], metadata["mission_names"]
+                        # Convert PDF to images using pdftoppm
+                        output_prefix = os.path.join(temp_dir, "page")
+                        try:
+                            result = subprocess.run(
+                                ["pdftoppm", "-jpeg", pdf_path, output_prefix],
+                                check=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True
                             )
-                        )
-                        conn.commit()
-                    except mysql.connector.Error as e:
-                        logging.error(f"MySQL error during insert for {pdf_file}: {str(e)}")
-                        conn.close()
-                        conn = connect_to_db()
-                        cursor = conn.cursor()
-                        continue
+                            logging.debug(f"pdftoppm stdout: {result.stdout}")
+                            logging.debug(f"pdftoppm stderr: {result.stderr}")
+                        except subprocess.CalledProcessError as e:
+                            logging.error(f"pdftoppm failed for {pdf_file}: {e.stderr}")
+                            indexing_status_dict["files_processed"] += 1
+                            indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
+                            save_indexing_status()
+                            continue
+                        
+                        # Find all generated images (pdftoppm names them page-001.jpg, page-002.jpg, etc.)
+                        for f in os.listdir(temp_dir):
+                            if f.endswith('.jpg'):
+                                # Normalize the file name for consistent sorting
+                                page_num = f.split('-')[1].split('.jpg')[0]
+                                page_num = int(page_num.lstrip('0') or '0')  # Handle page-000.jpg
+                                page_images.append((f, page_num))
+                        page_images.sort(key=lambda x: x[1])  # Sort by page number
+                        page_images = [f[0] for f in page_images]  # Keep only the filenames
+                        
+                        # Limit the number of pages to reduce memory usage (first 3 pages only)
+                        page_images = page_images[:3]
+                        
+                        if not page_images:
+                            logging.error(f"No images generated by pdftoppm for {pdf_file}")
+                            indexing_status_dict["files_processed"] += 1
+                            indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
+                            save_indexing_status()
+                            continue
+                        
+                        # Perform OCR on each page using EasyOCR (CPU-only)
+                        ocr_text = []
+                        max_retries = 2
+                        for i, page_image in enumerate(page_images):
+                            image_path = os.path.join(temp_dir, page_image)
+                            os.chmod(image_path, 0o664)
+                            os.chown(image_path, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                            # Validate the image
+                            is_valid, reason = validate_image(image_path)
+                            if not is_valid:
+                                logging.warning(f"Skipping image {image_path}: {reason}")
+                                continue
+                            for attempt in range(max_retries):
+                                try:
+                                    # Log system resources before OCR
+                                    log_system_resources()
+                                    # Add timeout for OCR operation
+                                    def timeout_handler(signum, frame):
+                                        raise TimeoutError("OCR operation timed out")
+                                    signal.signal(signal.SIGALRM, timeout_handler)
+                                    signal.alarm(60)  # Set a 60-second timeout
+                                    result = reader.readtext(image_path, detail=0)
+                                    signal.alarm(0)  # Disable the alarm
+                                    text = " ".join(result).strip()
+                                    if text:
+                                        ocr_text.append(f"Page {i+1}:\n{text}\n{'='*80}")
+                                    break  # Success, exit retry loop
+                                except TimeoutError as e:
+                                    logging.error(f"OCR timed out for {image_path}: {str(e)}")
+                                    if attempt < max_retries - 1:
+                                        logging.info("Retrying OCR on next attempt...")
+                                        time.sleep(5)
+                                        continue
+                                    else:
+                                        logging.warning(f"Max retries reached for OCR on {image_path}. Skipping page.")
+                                        break
+                                except Exception as e:
+                                    logging.error(f"Error performing OCR on {image_path} (attempt {attempt+1}/{max_retries}): {str(e)}")
+                                    if attempt < max_retries - 1:
+                                        logging.info("Retrying OCR on next attempt...")
+                                        time.sleep(5)
+                                        continue
+                                    else:
+                                        logging.warning(f"Max retries reached for OCR on {image_path}. Skipping page.")
+                                        break
+                                finally:
+                                    time.sleep(2)  # Delay to prevent CPU overload
+                        
+                        # Save OCR text
+                        with open(ocr_path, 'w') as f:
+                            f.write('\n'.join(ocr_text))
+                        os.chmod(ocr_path, 0o664)
+                        os.chown(ocr_path, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                        content = '\n'.join(ocr_text)
                     
-                    indexing_status_dict["files_processed"] += 1
-                    indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
-                    save_indexing_status()
-                    logging.info(f"Indexed {pdf_file} with metadata - Date: {metadata['date']}, Time: {metadata['time']}, Location: {metadata['location']}, Mission Names: {metadata['mission_names']}")
+                    except Exception as e:
+                        logging.error(f"Error processing {pdf_file}: {str(e)}. Skipping file.")
+                        indexing_status_dict["files_processed"] += 1
+                        indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
+                        save_indexing_status()
+                        continue
+                    finally:
+                        # Clean up temporary directory after a delay
+                        time.sleep(1)
+                        shutil.rmtree(temp_dir, ignore_errors=True)
                 
-                except Exception as e:
-                    logging.error(f"Error processing {pdf_file}: {str(e)}. Skipping file.")
-                    indexing_status_dict["files_processed"] += 1
-                    indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
-                    save_indexing_status()
+                # Store in MySQL with metadata
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO files (id, filename, content, index_time, date, time, location, mission_names)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            content=%s, index_time=%s, date=%s, time=%s, location=%s, mission_names=%s
+                        """,
+                        (
+                            item_id, pdf_file, content, datetime.now(),
+                            metadata["date"], metadata["time"], metadata["location"], metadata["mission_names"],
+                            content, datetime.now(),
+                            metadata["date"], metadata["time"], metadata["location"], metadata["mission_names"]
+                        )
+                    )
+                    conn.commit()
+                except mysql.connector.Error as e:
+                    logging.error(f"MySQL error during insert for {pdf_file}: {str(e)}")
+                    conn.close()
+                    conn = connect_to_db()
+                    cursor = conn.cursor()
                     continue
-                finally:
-                    # Clean up temporary directory after a delay
-                    time.sleep(1)
-                    shutil.rmtree(temp_dir, ignore_errors=True)
+                
+                indexing_status_dict["files_processed"] += 1
+                indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
+                save_indexing_status()
+                logging.info(f"Indexed {pdf_file} with metadata - Date: {metadata['date']}, Time: {metadata['time']}, Location: {metadata['location']}, Mission Names: {metadata['mission_names']}")
+        
         else:
             logging.info("No files to index.")
     
@@ -655,6 +668,13 @@ def download_national_archives():
             filename = os.path.join(BASE_DIR, "national_archives", os.path.basename(download_url))
             if os.path.exists(filename) and os.path.getsize(filename) > 0:
                 logging.info(f"Skipping existing file: {filename}")
+                # Simulate a small "download" to keep the gauge active
+                chunk_bytes = 0
+                chunk_start_time = time.time()
+                requests.head(download_url)
+                elapsed = time.time() - chunk_start_time
+                download_status_dict["download_speed"] = (1024 / 1024) / elapsed  # Simulate 1 KB download
+                time.sleep(1)  # Delay to keep gauge active
                 continue
             
             logging.info(f"Downloading {download_url}...")
@@ -671,12 +691,14 @@ def download_national_archives():
                         download_status_dict["bytes_downloaded"] += len(chunk)
                         chunk_bytes += len(chunk)
                         elapsed = time.time() - chunk_start_time
-                        if elapsed >= 1:  # Update speed every second
+                        if elapsed >= 0.5:  # Update speed every 0.5 seconds
                             download_status_dict["download_speed"] = (chunk_bytes / 1024) / elapsed
                             chunk_bytes = 0
                             chunk_start_time = time.time()
             file_size = os.path.getsize(filename + ".tmp") / (1024 ** 2)  # Convert to MB
             os.rename(filename + ".tmp", filename)
+            os.chmod(filename, 0o664)
+            os.chown(filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
             logging.info(f"Downloaded {filename} ({file_size:.2f} MB)")
             
             # If it's a ZIP file, extract it
@@ -684,7 +706,12 @@ def download_national_archives():
                 logging.info(f"Extracting {filename}...")
                 with zipfile.ZipFile(filename, 'r') as zip_ref:
                     zip_ref.extractall(os.path.join(BASE_DIR, "national_archives"))
+                for extracted_file in os.listdir(os.path.join(BASE_DIR, "national_archives")):
+                    extracted_path = os.path.join(BASE_DIR, "national_archives", extracted_file)
+                    os.chmod(extracted_path, 0o664)
+                    os.chown(extracted_path, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                 logging.info(f"Extracted {filename}")
+            time.sleep(1)  # Delay to keep gauge active
         
         # Request bulk download if no direct links are found
         if not download_links:
@@ -694,6 +721,7 @@ def download_national_archives():
                 data={"subject": "JFK Bulk Download"}
             )
             logging.info("Bulk download request sent. Check your email for the download link.")
+            time.sleep(5)  # Delay to keep gauge active
     
     except Exception as e:
         logging.error(f"Error downloading from National Archives: {str(e)}")
@@ -717,6 +745,7 @@ def run_dallas_police_scraper():
         
         # Poll the speed log file while the subprocess is running
         while process.poll() is None:
+            download_status_dict["in_progress"] = True
             try:
                 with open(SPEED_LOG_FILE, 'r') as f:
                     speed_data = json.load(f)
@@ -724,7 +753,7 @@ def run_dallas_police_scraper():
             except Exception as e:
                 logging.error(f"Failed to read download speed: {str(e)}")
                 download_status_dict["download_speed"] = 0
-            time.sleep(1)  # Check every second
+            time.sleep(0.5)  # Check every 0.5 seconds to keep gauge active
         
         # Check if the subprocess completed successfully
         stdout, stderr = process.communicate()
@@ -1108,8 +1137,8 @@ cat > "$TEMPLATES_DIR/index.html" << 'EOF'
                 .catch(error => console.error('Error searching documents:', error));
         }
 
-        // Update statuses every 2 seconds
-        setInterval(updateDownloadStatus, 2000);
+        // Update statuses every 1 second for download to catch short-lived downloads
+        setInterval(updateDownloadStatus, 1000);
         setInterval(updateIndexingStatus, 2000);
         setInterval(updateSystemMetrics, 2000);
         setInterval(updateLogs, 5000);
@@ -1184,6 +1213,7 @@ def scrape_dallas_police():
     # Ensure the save directory exists
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.chmod(SAVE_DIR, 0o775)
+    os.chown(SAVE_DIR, 1000, 1000)  # Assuming jfk user has UID/GID 1000
     
     # Clear the download speed at the start
     clear_download_speed()
@@ -1207,7 +1237,7 @@ def scrape_dallas_police():
                 if chunk:
                     chunk_bytes += len(chunk)
                     elapsed = time.time() - chunk_start_time
-                    if elapsed >= 1:  # Update speed every second
+                    if elapsed >= 0.5:  # Update speed every 0.5 seconds
                         update_download_speed(chunk_bytes, elapsed)
                         chunk_bytes = 0
                         chunk_start_time = time.time()
@@ -1229,7 +1259,7 @@ def scrape_dallas_police():
                     requests.head(doc_url)
                     elapsed = time.time() - chunk_start_time
                     update_download_speed(1024, elapsed)  # Simulate 1 KB download
-                    time.sleep(0.5)  # Small delay to keep gauge active
+                    time.sleep(1)  # Delay to keep gauge active
                     continue
                 
                 # Download the PDF
@@ -1246,16 +1276,17 @@ def scrape_dallas_police():
                                 f.write(chunk)
                                 chunk_bytes += len(chunk)
                                 elapsed = time.time() - chunk_start_time
-                                if elapsed >= 1:  # Update speed every second
+                                if elapsed >= 0.5:  # Update speed every 0.5 seconds
                                     update_download_speed(chunk_bytes, elapsed)
                                     chunk_bytes = 0
                                     chunk_start_time = time.time()
                     os.rename(pdf_filename + ".tmp", pdf_filename)
                     os.chmod(pdf_filename, 0o664)
+                    os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                     file_size = os.path.getsize(pdf_filename) / (1024 ** 2)  # Convert to MB
                     logging.info(f"Downloaded {pdf_filename} ({file_size:.2f} MB)")
                     downloaded_files += 1
-                    time.sleep(1)  # Small delay to avoid overwhelming the server
+                    time.sleep(1)  # Delay to keep gauge active
                 except Exception as e:
                     logging.error(f"Failed to download {doc_url}: {str(e)}")
                     # Try downloading individual pages as a fallback
@@ -1278,6 +1309,7 @@ def scrape_dallas_police():
                             temp_dir = os.path.join(SAVE_DIR, f"temp_{metapth_id}")
                             os.makedirs(temp_dir, exist_ok=True)
                             os.chmod(temp_dir, 0o775)
+                            os.chown(temp_dir, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                             try:
                                 for i, canvas in enumerate(pages):
                                     image_url = canvas['images'][0]['resource']['@id']
@@ -1293,21 +1325,21 @@ def scrape_dallas_police():
                                                 img_f.write(chunk)
                                                 chunk_bytes += len(chunk)
                                                 elapsed = time.time() - chunk_start_time
-                                                if elapsed >= 1:
+                                                if elapsed >= 0.5:
                                                     update_download_speed(chunk_bytes, elapsed)
                                                     chunk_bytes = 0
                                                     chunk_start_time = time.time()
                                     os.chmod(image_path, 0o664)
+                                    os.chown(image_path, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                                     images.append(image_path)
                                     time.sleep(0.5)
                                 logging.info("Using /high_res_d/ links, skipping other sources")
-                                # Convert images to PDF
+                                # Convert images to PDF as the jfk user
                                 if images:
-                                    subprocess.run(
-                                        ["img2pdf"] + images + ["-o", pdf_filename],
-                                        check=True
-                                    )
+                                    cmd = ["sudo", "-u", "jfk", "img2pdf"] + images + ["-o", pdf_filename]
+                                    subprocess.run(cmd, check=True)
                                     os.chmod(pdf_filename, 0o664)
+                                    os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
                                     file_size = os.path.getsize(pdf_filename) / (1024 ** 2)
                                     logging.info(f"Created PDF {pdf_filename} from images ({file_size:.2f} MB)")
                                     downloaded_files += 1
@@ -1486,39 +1518,4 @@ systemctl restart jfk-index.service
 cd "$REPO_DIR"
 
 # Copy the rotated log files to the repository
-cp "$BASE_DIR/indexing_$PREV_DATE.log" .
-cp "$BASE_DIR/jfk_manager_$PREV_DATE.log" .
-
-# Also copy the current log files (which are now empty or starting fresh)
-if [ -f "$LOG_PATH" ]; then
-    cp "$LOG_PATH" .
-else
-    touch indexing.log
-fi
-if [ -f "$MANAGER_LOG_PATH" ]; then
-    cp "$MANAGER_LOG_PATH" .
-else
-    touch jfk_manager.log
-fi
-
-# Commit and push to GitHub
-git add .
-git commit -m "Daily log rotation and upload - $PREV_DATE"
-git push origin main
-
-echo "Log files rotated and previous day's logs uploaded to GitHub at $(date)."
-EOF
-chmod +x "$CRON_SCRIPT"
-chown jfk:jfk "$CRON_SCRIPT"
-chmod 775 "$CRON_SCRIPT"
-
-# Add cron job to run daily at midnight
-(crontab -l 2>/dev/null; echo "0 0 * * * $CRON_SCRIPT") | crontab -
-echo "Cron job set up to rotate and upload log files daily at midnight to GitHub."
-
-echo "Installation complete! The JFK document management system is fully set up and running."
-echo "The system will automatically start on boot."
-echo "Access the web interface at http://192.168.1.176:5000"
-echo "Monitor indexing progress with: tail -f $LOG_PATH"
-echo "Files and logs are being uploaded to GitHub at $REPO_URL."
-echo "Log rotation and uploads will occur daily at midnight."
+cp "$BASE_DIR/indexing_$PREV
