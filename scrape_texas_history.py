@@ -27,12 +27,17 @@ SAVE_DIR = "/jfk_data/dallas_police"
 BASE_URL = "https://texashistory.unt.edu/explore/collections/JFKDP/browse/"
 SPEED_LOG_FILE = "/jfk_data/dallas_police_download_speed.json"
 
+# Set umask to ensure files are created with the correct permissions
+os.umask(0o022)
+
 def update_download_speed(bytes_downloaded, elapsed_time):
     """Update the download speed in a shared file."""
     speed = (bytes_downloaded / 1024) / elapsed_time  # KB/s
     try:
         with open(SPEED_LOG_FILE, 'w') as f:
             json.dump({"download_speed": speed}, f)
+        os.chmod(SPEED_LOG_FILE, 0o664)
+        os.chown(SPEED_LOG_FILE, 1000, 1000)  # Assuming jfk user has UID/GID 1000
     except Exception as e:
         logging.error(f"Failed to update download speed: {str(e)}")
 
@@ -41,17 +46,31 @@ def clear_download_speed():
     try:
         with open(SPEED_LOG_FILE, 'w') as f:
             json.dump({"download_speed": 0}, f)
+        os.chmod(SPEED_LOG_FILE, 0o664)
+        os.chown(SPEED_LOG_FILE, 1000, 1000)  # Assuming jfk user has UID/GID 1000
     except Exception as e:
         logging.error(f"Failed to clear download speed: {str(e)}")
+
+def log_file_permissions(file_path):
+    """Log the permissions and ownership of a file for debugging."""
+    try:
+        stat_info = os.stat(file_path)
+        perms = oct(stat_info.st_mode & 0o777)[2:]
+        uid = stat_info.st_uid
+        gid = stat_info.st_gid
+        logging.info(f"File {file_path} - Permissions: {perms}, UID: {uid}, GID: {gid}")
+    except Exception as e:
+        logging.error(f"Failed to log permissions for {file_path}: {str(e)}")
 
 def scrape_dallas_police():
     """Scrape and download PDF files from the Dallas Police Archives on the Portal to Texas History."""
     logging.info("Starting Dallas Police Archives scraping...")
     
-    # Ensure the save directory exists
+    # Ensure the save directory exists and has correct permissions
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.chmod(SAVE_DIR, 0o775)
     os.chown(SAVE_DIR, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+    log_file_permissions(SAVE_DIR)
     
     # Clear the download speed at the start
     clear_download_speed()
@@ -75,7 +94,7 @@ def scrape_dallas_police():
                 if chunk:
                     chunk_bytes += len(chunk)
                     elapsed = time.time() - chunk_start_time
-                    if elapsed >= 0.5:  # Update speed every 0.5 seconds
+                    if elapsed >= 0.1:  # Update speed more frequently
                         update_download_speed(chunk_bytes, elapsed)
                         chunk_bytes = 0
                         chunk_start_time = time.time()
@@ -114,13 +133,14 @@ def scrape_dallas_police():
                                 f.write(chunk)
                                 chunk_bytes += len(chunk)
                                 elapsed = time.time() - chunk_start_time
-                                if elapsed >= 0.5:  # Update speed every 0.5 seconds
+                                if elapsed >= 0.1:  # Update speed more frequently
                                     update_download_speed(chunk_bytes, elapsed)
                                     chunk_bytes = 0
                                     chunk_start_time = time.time()
                     os.rename(pdf_filename + ".tmp", pdf_filename)
                     os.chmod(pdf_filename, 0o664)
                     os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                    log_file_permissions(pdf_filename)
                     file_size = os.path.getsize(pdf_filename) / (1024 ** 2)  # Convert to MB
                     logging.info(f"Downloaded {pdf_filename} ({file_size:.2f} MB)")
                     downloaded_files += 1
@@ -148,6 +168,7 @@ def scrape_dallas_police():
                             os.makedirs(temp_dir, exist_ok=True)
                             os.chmod(temp_dir, 0o775)
                             os.chown(temp_dir, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                            log_file_permissions(temp_dir)
                             try:
                                 for i, canvas in enumerate(pages):
                                     image_url = canvas['images'][0]['resource']['@id']
@@ -163,21 +184,23 @@ def scrape_dallas_police():
                                                 img_f.write(chunk)
                                                 chunk_bytes += len(chunk)
                                                 elapsed = time.time() - chunk_start_time
-                                                if elapsed >= 0.5:
+                                                if elapsed >= 0.1:
                                                     update_download_speed(chunk_bytes, elapsed)
                                                     chunk_bytes = 0
                                                     chunk_start_time = time.time()
                                     os.chmod(image_path, 0o664)
                                     os.chown(image_path, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                                    log_file_permissions(image_path)  # Log permissions for debugging
                                     images.append(image_path)
                                     time.sleep(0.5)
                                 logging.info("Using /high_res_d/ links, skipping other sources")
-                                # Convert images to PDF as the jfk user
+                                # Convert images to PDF
                                 if images:
-                                    cmd = ["sudo", "-u", "jfk", "img2pdf"] + images + ["-o", pdf_filename]
+                                    cmd = ["img2pdf"] + images + ["-o", pdf_filename]
                                     subprocess.run(cmd, check=True)
                                     os.chmod(pdf_filename, 0o664)
                                     os.chown(pdf_filename, 1000, 1000)  # Assuming jfk user has UID/GID 1000
+                                    log_file_permissions(pdf_filename)
                                     file_size = os.path.getsize(pdf_filename) / (1024 ** 2)
                                     logging.info(f"Created PDF {pdf_filename} from images ({file_size:.2f} MB)")
                                     downloaded_files += 1

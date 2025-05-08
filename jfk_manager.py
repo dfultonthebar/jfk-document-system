@@ -11,6 +11,7 @@ import GPUtil
 import shutil
 import re
 import json
+import threading
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from flask import Flask, render_template, request, jsonify
@@ -47,13 +48,15 @@ STATUS_FILE = os.path.join(BASE_DIR, "indexing_status.json")
 DALLAS_POLICE_DIR = os.path.join(BASE_DIR, "dallas_police")
 SPEED_LOG_FILE = "/jfk_data/dallas_police_download_speed.json"
 
-# Global dictionaries to track download and indexing status
+# Global dictionaries to track download and indexing status with thread safety
 download_status_dict = {
     "in_progress": False,
     "bytes_downloaded": 0,
     "start_time": 0,
     "download_speed": 0  # KB/s
 }
+download_status_lock = threading.Lock()
+
 indexing_status_dict = {
     "in_progress": False,
     "total_files": 0,
@@ -347,28 +350,33 @@ def index_files(limit=None):
         conn = connect_to_db()
         cursor = conn.cursor()
         
+        # Recompute the list of PDF files to ensure accuracy
         pdf_files = []
         for subdir in ["national_archives", "dallas_police"]:
             subdir_path = os.path.join(BASE_DIR, subdir)
-            pdf_files.extend(
-                [os.path.join(subdir, f) for f in os.listdir(subdir_path) if f.endswith('.pdf')]
-            )
+            for f in os.listdir(subdir_path):
+                if f.endswith('.pdf'):
+                    relative_path = os.path.join(subdir, f)
+                    pdf_files.append(relative_path)
         if limit:
             pdf_files = pdf_files[:limit]
         
         indexing_status_dict["total_files"] = len(pdf_files)
+        logging.info(f"Total files to index: {indexing_status_dict['total_files']}")
         save_indexing_status()
         
         if indexing_status_dict["total_files"] > 0:
             for pdf_file in pdf_files:
-                item_id = os.path.basename(pdf_file).replace('output_', '').replace('.pdf', '')
+                # Use the full relative path as part of the item_id to ensure uniqueness
+                item_id = pdf_file.replace('.pdf', '').replace('/', '_')
                 pdf_path = os.path.join(BASE_DIR, pdf_file)
                 
                 # Check if the file is already indexed
                 try:
                     cursor.execute("SELECT id FROM files WHERE id = %s", (item_id,))
-                    if cursor.fetchone():
-                        logging.info(f"Skipping already indexed file: {pdf_file}")
+                    result = cursor.fetchone()
+                    if result:
+                        logging.info(f"Skipping already indexed file: {pdf_file} (ID: {item_id})")
                         indexing_status_dict["files_processed"] += 1
                         indexing_status_dict["progress"] = (indexing_status_dict["files_processed"] / indexing_status_dict["total_files"]) * 100
                         save_indexing_status()
@@ -563,9 +571,12 @@ def index_files(limit=None):
 def download_national_archives():
     """Download files from the National Archives, including 2025 release."""
     global download_status_dict
+    # Set in_progress immediately to ensure the gauge reflects activity
     download_status_dict["in_progress"] = True
-    download_status_dict["start_time"] = time.time()
-    download_status_dict["bytes_downloaded"] = 0
+    with download_status_lock:
+        download_status_dict["start_time"] = time.time()
+        download_status_dict["bytes_downloaded"] = 0
+        download_status_dict["download_speed"] = 0
 
     logging.info("Starting National Archives download...")
     try:
@@ -591,7 +602,9 @@ def download_national_archives():
                 chunk_start_time = time.time()
                 requests.head(download_url)
                 elapsed = time.time() - chunk_start_time
-                download_status_dict["download_speed"] = (1024 / 1024) / elapsed  # Simulate 1 KB download
+                with download_status_lock:
+                    download_status_dict["download_speed"] = (1024 / 1024) / elapsed  # Simulate 1 KB download
+                    logging.info(f"Simulated download speed for skipped file: {download_status_dict['download_speed']:.2f} KB/s")
                 time.sleep(1)  # Delay to keep gauge active
                 continue
             
@@ -606,11 +619,13 @@ def download_national_archives():
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if chunk:
                         f.write(chunk)
-                        download_status_dict["bytes_downloaded"] += len(chunk)
                         chunk_bytes += len(chunk)
                         elapsed = time.time() - chunk_start_time
-                        if elapsed >= 0.5:  # Update speed every 0.5 seconds
-                            download_status_dict["download_speed"] = (chunk_bytes / 1024) / elapsed
+                        if elapsed >= 0.1:  # Update speed more frequently (every 0.1 seconds)
+                            with download_status_lock:
+                                download_status_dict["bytes_downloaded"] += len(chunk)
+                                download_status_dict["download_speed"] = (chunk_bytes / 1024) / elapsed
+                                logging.info(f"Download speed: {download_status_dict['download_speed']:.2f} KB/s")
                             chunk_bytes = 0
                             chunk_start_time = time.time()
             file_size = os.path.getsize(filename + ".tmp") / (1024 ** 2)  # Convert to MB
@@ -644,22 +659,32 @@ def download_national_archives():
     except Exception as e:
         logging.error(f"Error downloading from National Archives: {str(e)}")
     finally:
-        time.sleep(5)  # Ensure the gauge has time to display the status
-        download_status_dict["in_progress"] = False
-        download_status_dict["download_speed"] = 0
+        # Keep the in_progress state for a few seconds to ensure the gauge displays the activity
+        time.sleep(5)
+        with download_status_lock:
+            download_status_dict["in_progress"] = False
+            download_status_dict["download_speed"] = 0
+        download_status_dict["in_progress"] = False  # Ensure it's reset outside the lock
 
 def run_dallas_police_scraper():
-    """Run the scrape_texas_history.py script for Dallas Police Archives."""
+    """Run the scrape_texas_history.py script for Dallas Police Archives as the jfk user."""
     global download_status_dict
+    # Set in_progress immediately to ensure the gauge reflects activity
     download_status_dict["in_progress"] = True
-    download_status_dict["start_time"] = time.time()
-    download_status_dict["bytes_downloaded"] = 0
+    with download_status_lock:
+        download_status_dict["start_time"] = time.time()
+        download_status_dict["bytes_downloaded"] = 0
 
     logging.info("Starting Dallas Police Archives download...")
     try:
         # Change to the dallas_police directory to run the scraper
         os.chdir(DALLAS_POLICE_DIR)
-        process = subprocess.Popen(["/jfk_data/scrape_texas_history.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Run the scraper as the jfk user
+        process = subprocess.Popen(
+            ["sudo", "-u", "jfk", "/jfk_data/scrape_texas_history.py"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
         
         # Poll the speed log file while the subprocess is running
         while process.poll() is None:
@@ -667,10 +692,13 @@ def run_dallas_police_scraper():
             try:
                 with open(SPEED_LOG_FILE, 'r') as f:
                     speed_data = json.load(f)
-                    download_status_dict["download_speed"] = speed_data.get("download_speed", 0)
+                    with download_status_lock:
+                        download_status_dict["download_speed"] = speed_data.get("download_speed", 0)
+                        logging.info(f"Dallas Police download speed: {download_status_dict['download_speed']:.2f} KB/s")
             except Exception as e:
                 logging.error(f"Failed to read download speed: {str(e)}")
-                download_status_dict["download_speed"] = 0
+                with download_status_lock:
+                    download_status_dict["download_speed"] = 0
             time.sleep(0.5)  # Check every 0.5 seconds to keep gauge active
         
         # Check if the subprocess completed successfully
@@ -684,9 +712,12 @@ def run_dallas_police_scraper():
     except Exception as e:
         logging.error(f"Error during Dallas Police download: {str(e)}")
     finally:
-        time.sleep(5)  # Ensure the gauge has time to display the status
-        download_status_dict["in_progress"] = False
-        download_status_dict["download_speed"] = 0
+        # Keep the in_progress state for a few seconds to ensure the gauge displays the activity
+        time.sleep(5)
+        with download_status_lock:
+            download_status_dict["in_progress"] = False
+            download_status_dict["download_speed"] = 0
+        download_status_dict["in_progress"] = False  # Ensure it's reset outside the lock
 
 @app.route('/')
 def index():
@@ -787,11 +818,13 @@ def system_metrics():
 def download_status():
     """Return download status and speed."""
     logging.info("Handling request for /download_status")
-    logging.info(f"Download status - In progress: {download_status_dict['in_progress']}, Speed: {download_status_dict['download_speed']} KB/s")
-    return jsonify({
-        "in_progress": download_status_dict["in_progress"],
-        "download_speed": download_status_dict["download_speed"]  # KB/s
-    })
+    with download_status_lock:
+        status = {
+            "in_progress": download_status_dict["in_progress"],
+            "download_speed": download_status_dict["download_speed"]  # KB/s
+        }
+    logging.info(f"Download status - In progress: {status['in_progress']}, Speed: {status['download_speed']} KB/s")
+    return jsonify(status)
 
 @app.route('/indexing_status')
 def indexing_status():
