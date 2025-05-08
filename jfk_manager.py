@@ -132,6 +132,8 @@ def validate_image(image_path, max_size_mb=10):
             img.verify()  # Verify the image is valid
             img = Image.open(image_path)  # Re-open after verify
             width, height = img.size
+            if width <= 0 or height <= 0:
+                return False, "Image dimensions are invalid"
             logging.info(f"Image {image_path} - Size: {file_size_mb:.2f}MB, Dimensions: {width}x{height}")
             # Check resolution (downscale if too large)
             max_dimension = 2000
@@ -183,6 +185,7 @@ def extract_metadata(pdf_path, max_retries=2):
                 # Convert PDF to images and use OCR
                 temp_dir = os.path.join(BASE_DIR, f"temp_metadata_{os.path.basename(pdf_path).replace('.pdf', '')}")
                 os.makedirs(temp_dir, exist_ok=True)
+                os.chmod(temp_dir, 0o775)
                 try:
                     output_prefix = os.path.join(temp_dir, "page")
                     subprocess.run(
@@ -206,6 +209,7 @@ def extract_metadata(pdf_path, max_retries=2):
                     
                     for page_image in page_images:
                         image_path = os.path.join(temp_dir, page_image)
+                        os.chmod(image_path, 0o664)
                         # Validate the image
                         is_valid, reason = validate_image(image_path)
                         if not is_valid:
@@ -239,11 +243,6 @@ def extract_metadata(pdf_path, max_retries=2):
                                 logging.warning(f"Max retries reached for OCR on {image_path}. Skipping page.")
                                 continue
                         finally:
-                            if os.path.exists(image_path):
-                                try:
-                                    os.remove(image_path)
-                                except Exception as e:
-                                    logging.warning(f"Failed to remove {image_path}: {str(e)}")
                             time.sleep(2)  # Delay to prevent CPU overload
                 except Exception as e:
                     logging.error(f"OCR fallback failed for {pdf_path} (attempt {attempt+1}/{max_retries}): {str(e)}")
@@ -254,6 +253,8 @@ def extract_metadata(pdf_path, max_retries=2):
                         logging.warning(f"Max retries reached for OCR on {pdf_path}. Skipping file.")
                         return None
                 finally:
+                    # Clean up temporary directory after a delay
+                    time.sleep(1)
                     shutil.rmtree(temp_dir, ignore_errors=True)
             
             # Normalize the text to handle OCR issues
@@ -391,6 +392,7 @@ def index_files(limit=None):
                 # Create a temporary directory for page images
                 temp_dir = os.path.join(BASE_DIR, f"temp_{item_id}")
                 os.makedirs(temp_dir, exist_ok=True)
+                os.chmod(temp_dir, 0o775)
                 page_images = []
                 try:
                     # Convert PDF to images using pdftoppm
@@ -437,6 +439,7 @@ def index_files(limit=None):
                     max_retries = 2
                     for i, page_image in enumerate(page_images):
                         image_path = os.path.join(temp_dir, page_image)
+                        os.chmod(image_path, 0o664)
                         # Validate the image
                         is_valid, reason = validate_image(image_path)
                         if not is_valid:
@@ -476,11 +479,6 @@ def index_files(limit=None):
                                     logging.warning(f"Max retries reached for OCR on {image_path}. Skipping page.")
                                     break
                             finally:
-                                if os.path.exists(image_path):
-                                    try:
-                                        os.remove(image_path)  # Clean up the page image
-                                    except Exception as e:
-                                        logging.warning(f"Failed to remove {image_path}: {str(e)}")
                                 time.sleep(2)  # Delay to prevent CPU overload
                     
                     # Save OCR text
@@ -525,9 +523,9 @@ def index_files(limit=None):
                     save_indexing_status()
                     continue
                 finally:
-                    # Clean up temporary directory
-                    if os.path.exists(temp_dir):
-                        shutil.rmtree(temp_dir, ignore_errors=True)
+                    # Clean up temporary directory after a delay
+                    time.sleep(1)
+                    shutil.rmtree(temp_dir, ignore_errors=True)
         else:
             logging.info("No files to index.")
     
@@ -610,6 +608,7 @@ def download_national_archives():
     except Exception as e:
         logging.error(f"Error downloading from National Archives: {str(e)}")
     finally:
+        time.sleep(5)  # Ensure the gauge has time to display the status
         download_status_dict["in_progress"] = False
         download_status_dict["download_speed"] = 0
 
@@ -648,6 +647,7 @@ def run_dallas_police_scraper():
     except Exception as e:
         logging.error(f"Error during Dallas Police download: {str(e)}")
     finally:
+        time.sleep(5)  # Ensure the gauge has time to display the status
         download_status_dict["in_progress"] = False
         download_status_dict["download_speed"] = 0
 
